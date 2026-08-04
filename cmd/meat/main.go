@@ -38,7 +38,7 @@ import (
 	"strings"
 	"time"
 
-	"meat.dev/meat"
+	"github.com/brandonbosch/porkchop/meat"
 )
 
 const usage = `meat — abridge a diff into a "reading diff"

@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"meat.dev/meat"
+	"github.com/brandonbosch/porkchop/meat"
 )
 
 // cacheDir is the directory holding cached results. Overridable via MEAT_CACHE
