@@ -6,7 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/brandonbosch/porkchop/internal/diffview"
@@ -117,8 +118,7 @@ func TestRenderFrameGoldens(t *testing.T) {
 				RawDiff:     string(raw),
 			})
 			updated, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
-			frame := updated.View()
-			plain := ansi.Strip(frame)
+			plain := ansi.Strip(updated.View().Content)
 
 			// Header manifest, including the trust headline.
 			for _, want := range []string{"porkchop", "test change summary", elision, "% smaller", "hidden in"} {
@@ -232,7 +232,7 @@ func TestExpandRevealsOriginal(t *testing.T) {
 				t.Fatalf("collapsed body already shows hidden line %q", want)
 			}
 
-			expanded, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+			expanded, _ := m.Update(tea.KeyPressMsg{Code: 'e'})
 			em := expanded.(Model)
 			after := ansi.Strip(em.renderBody())
 			if !strings.Contains(after, want) {
@@ -246,7 +246,7 @@ func TestExpandRevealsOriginal(t *testing.T) {
 			}
 
 			// And `e` again restores the collapsed view exactly.
-			collapsed, _ := em.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+			collapsed, _ := em.Update(tea.KeyPressMsg{Code: 'e'})
 			cm := collapsed.(Model)
 			if got := ansi.Strip(cm.renderBody()); got != before {
 				t.Error("collapsing did not restore the original body")
@@ -260,7 +260,7 @@ func TestExpandRevealsOriginal(t *testing.T) {
 func TestExpandAllRevealsEveryHiddenChangedLine(t *testing.T) {
 	for name, m := range alignedGoldens(t) {
 		t.Run(name, func(t *testing.T) {
-			all, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}})
+			all, _ := m.Update(tea.KeyPressMsg{Code: 'E'})
 			am := all.(Model)
 
 			wantHidden := 0
@@ -278,7 +278,7 @@ func TestExpandAllRevealsEveryHiddenChangedLine(t *testing.T) {
 			}
 
 			// E again collapses everything back.
-			none, _ := am.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}})
+			none, _ := am.Update(tea.KeyPressMsg{Code: 'E'})
 			nm := none.(Model)
 			for i, e := range nm.expanded {
 				if e {
@@ -294,7 +294,7 @@ func TestExpandAllRevealsEveryHiddenChangedLine(t *testing.T) {
 func TestAuditView(t *testing.T) {
 	for name, m := range alignedGoldens(t) {
 		t.Run(name, func(t *testing.T) {
-			audited, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+			audited, _ := m.Update(tea.KeyPressMsg{Code: 'a'})
 			am := audited.(Model)
 			if !am.audit {
 				t.Fatal("pressing a did not enter the audit view")
@@ -344,11 +344,11 @@ func TestAuditView(t *testing.T) {
 			}
 
 			// The frame must render, and esc must come back to the review view.
-			frame := ansi.Strip(am.View())
+			frame := ansi.Strip(am.View().Content)
 			if !strings.Contains(frame, "back to review") {
 				t.Error("audit footer missing its exit hint")
 			}
-			back, _ := am.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			back, _ := am.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 			if back.(Model).audit {
 				t.Error("esc did not leave the audit view")
 			}
@@ -366,13 +366,13 @@ func TestElisionNavigationClamps(t *testing.T) {
 			}
 			cur := tea.Model(m)
 			for range len(m.marks) + 3 {
-				cur, _ = cur.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+				cur, _ = cur.Update(tea.KeyPressMsg{Code: 'n'})
 			}
 			if got, want := cur.(Model).cur, len(m.marks)-1; got != want {
 				t.Errorf("after walking past the end, cur = %d, want %d", got, want)
 			}
 			for range len(m.marks) + 3 {
-				cur, _ = cur.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+				cur, _ = cur.Update(tea.KeyPressMsg{Code: 'p'})
 			}
 			if got := cur.(Model).cur; got != 0 {
 				t.Errorf("after walking past the start, cur = %d, want 0", got)
@@ -394,10 +394,47 @@ func TestNoOriginalDegradesCleanly(t *testing.T) {
 	sized, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	cur := sized
 	for _, k := range []rune{'e', 'E', 'n', 'p', 'a'} {
-		cur, _ = cur.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{k}})
-		if cur.View() == "" {
+		cur, _ = cur.Update(tea.KeyPressMsg{Code: k})
+		if cur.View().Content == "" {
 			t.Fatalf("view went empty after %q", k)
 		}
+	}
+}
+
+// TestBackgroundColorRepalettes covers what Lip Gloss's AdaptiveColor used to do
+// implicitly. The palette is now resolved against an explicit `dark` flag, so the
+// model must start dark (keeping offline rendering deterministic), switch when
+// the terminal reports a light background, and leave the rendered *text*
+// untouched either way — only the colors may differ.
+func TestBackgroundColorRepalettes(t *testing.T) {
+	m := New(Input{ReadingDiff: "@@ -1,1 +1,1 @@\n-a\n+b"})
+	if !m.dark {
+		t.Fatal("model should assume a dark background before the terminal answers")
+	}
+	sized, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	darkFrame := sized.View().Content
+	lit, _ := sized.Update(tea.BackgroundColorMsg{Color: lipgloss.Color("#ffffff")})
+	lm := lit.(Model)
+	if lm.dark {
+		t.Error("a white background did not switch the model to the light palette")
+	}
+	lightFrame := lm.View().Content
+
+	if darkFrame == lightFrame {
+		t.Error("light and dark palettes render identically — the swap did nothing")
+	}
+	if ansi.Strip(darkFrame) != ansi.Strip(lightFrame) {
+		t.Error("swapping the palette changed the text, not just the colors")
+	}
+
+	// And back again, so the swap is not one-way.
+	dk, _ := lm.Update(tea.BackgroundColorMsg{Color: lipgloss.Color("#000000")})
+	if !dk.(Model).dark {
+		t.Error("a black background did not switch back to the dark palette")
+	}
+	if dk.(Model).View().Content != darkFrame {
+		t.Error("returning to a dark background did not restore the dark frame")
 	}
 }
 
