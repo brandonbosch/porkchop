@@ -1,0 +1,19 @@
+porkchop
+Copyright 2026 Brandon Bosch
+
+This product is a fork of meat, and includes software developed by:
+
+    meat
+    Copyright 2026 Bold Software, Inc.
+    https://github.com/boldsoftware/meat
+    Licensed under the Apache License, Version 2.0.
+
+The abridging core under meat/ (and the reference CLI under cmd/meat/) is
+vendored from meat and kept as close to upstream as possible; the only
+modification to those trees is the Go module path (meat.dev ->
+github.com/brandonbosch/porkchop), applied so the fork builds under its own
+module. All other porkchop code — the TUI and its supporting packages under
+cmd/porkchop/ and internal/ — is new work added by this fork.
+
+Both the vendored core and the added code are distributed under the Apache
+License, Version 2.0. See the LICENSE file for the full license text.

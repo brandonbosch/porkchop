@@ -9,9 +9,9 @@ import (
 )
 
 // TestInstalledBinaryName builds the CLI the same way `go install` does and
-// asserts the produced executable is named `meat` (not `meat.dev`). This is the
-// whole point of locating the package under cmd/meat: Go derives the binary
-// name from the package's directory, so the directory must be `meat`.
+// asserts the produced executable is named `meat` (not the module path). This
+// is the whole point of locating the package under cmd/meat: Go derives the
+// binary name from the package's directory, so the directory must be `meat`.
 func TestInstalledBinaryName(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping binary build in short mode")
@@ -22,7 +22,7 @@ func TestInstalledBinaryName(t *testing.T) {
 	}
 
 	gobin := t.TempDir()
-	cmd := exec.Command(goBin, "install", "meat.dev/cmd/meat")
+	cmd := exec.Command(goBin, "install", "github.com/brandonbosch/porkchop/cmd/meat")
 	cmd.Env = append(os.Environ(), "GOBIN="+gobin)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("go install failed: %v\n%s", err, out)
