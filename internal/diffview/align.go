@@ -3,6 +3,7 @@ package diffview
 import (
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -40,7 +41,7 @@ func Align(raw, readingDiff string) Alignment {
 	rows := Parse(readingDiff)
 	rawRows := Parse(raw)
 
-	a := Alignment{Rows: rows, Raw: make([]string, len(rawRows))}
+	a := Alignment{Rows: rows, Raw: make([]string, len(rawRows)), Nums: make([]LineNo, len(rows))}
 	for i, r := range rawRows {
 		a.Raw[i] = r.Text
 	}
@@ -98,6 +99,15 @@ func Align(raw, readingDiff string) Alignment {
 		rawPos = at + 1
 	}
 
+	// Line numbers come from the raw side, where they are exact, and are carried
+	// across to the rows that matched. Deriving them from the reading diff's own
+	// @@ headers instead would drift by the size of every elision, which is
+	// precisely the content whose absence the reader is being asked to trust.
+	rawNums := rawLineNumbers(rawRows)
+	for _, m := range matches {
+		a.Nums[m.row] = rawNums[m.raw]
+	}
+
 	// The gaps between consecutive matches are the elisions. prevRow/prevRaw
 	// start at -1 so a diff whose opening lines were dropped yields a leading
 	// elision, and the tail is closed after the loop.
@@ -136,6 +146,20 @@ func rawFileNames(rawRows []Row) []string {
 	return files
 }
 
+// FileOf returns the path a metadata row names, for the two row kinds that name
+// one: "diff --git a/p b/p" and "+++ b/p". It reports false for every other line,
+// including a deletion's "+++ /dev/null", which names no file.
+//
+// It exists so a caller labelling reading-diff rows by file resolves paths the
+// same way the raw-side alignment does, rather than reimplementing the two
+// header shapes and drifting from it.
+func FileOf(line string) (string, bool) {
+	if p, ok := pathFromNewFileMarker(line); ok {
+		return p, true
+	}
+	return pathFromGitHeader(line)
+}
+
 func pathFromGitHeader(line string) (string, bool) {
 	rest, ok := strings.CutPrefix(line, "diff --git ")
 	if !ok {
@@ -170,6 +194,112 @@ type Alignment struct {
 	// Elisions are the runs of Raw the reading diff omits, in reading order and
 	// non-overlapping. Together with the matched rows they partition Raw.
 	Elisions []Elision
+	// Nums is parallel to Rows and gives each row's true position in the old and
+	// new versions of its file. It is zero — meaning "no number to show" — for
+	// structural rows, for fold rows, for either side of a row that exists on
+	// only one side, and for every row when no original was supplied.
+	Nums []LineNo
+}
+
+// LineNo is a row's position in the pre-image and post-image of the change.
+//
+// The numbers are read off the raw diff rather than the reading diff, because
+// the reading diff cannot support them: meat elides lines without renumbering
+// the @@ headers it leaves behind, so counting forward from a header inside a
+// reading diff drifts by the size of every gap it has passed. A wrong line
+// number in a tool whose purpose is justified trust is worse than no line
+// number, so a row porkchop cannot place exactly is left at zero and rendered
+// blank.
+type LineNo struct {
+	// Old is the 1-based line in the old version, or 0 if the row has none —
+	// which is the case for an added line.
+	Old int
+	// New is the 1-based line in the new version, or 0 for a removed line.
+	New int
+}
+
+// rawLineNumbers assigns every line of a raw diff its old and new line numbers,
+// counting forward from each hunk header. This is only sound on a raw diff,
+// where nothing has been removed; see LineNo.
+func rawLineNumbers(rawRows []Row) []LineNo {
+	nums := make([]LineNo, len(rawRows))
+	oldNo, newNo := 0, 0
+	for i, r := range rawRows {
+		switch r.Kind {
+		case RowHunk:
+			oldNo, newNo = hunkStarts(r.Text)
+		case RowContext:
+			nums[i] = LineNo{Old: oldNo, New: newNo}
+			oldNo++
+			newNo++
+		case RowDel:
+			nums[i] = LineNo{Old: oldNo}
+			oldNo++
+		case RowAdd:
+			nums[i] = LineNo{New: newNo}
+			newNo++
+		case RowFold:
+			// On the raw side a "..." line is ordinary source — a Python Ellipsis
+			// or stub body — not a marker, so it occupies a real line on whichever
+			// sides its polarity implies. This mirrors isChangedLine.
+			switch {
+			case r.Text == "":
+			case r.Text[0] == '+':
+				nums[i] = LineNo{New: newNo}
+				newNo++
+			case r.Text[0] == '-':
+				nums[i] = LineNo{Old: oldNo}
+				oldNo++
+			default:
+				nums[i] = LineNo{Old: oldNo, New: newNo}
+				oldNo++
+				newNo++
+			}
+		}
+	}
+	return nums
+}
+
+// hunkStarts reads the two starting line numbers out of an "@@ -a,b +c,d @@"
+// header. Only the starts are taken: meat documents that the counts go stale,
+// and nothing here needs them. A header that does not parse yields zeros, which
+// render blank rather than wrong.
+func hunkStarts(line string) (old, new int) {
+	rest, ok := strings.CutPrefix(line, "@@ ")
+	if !ok {
+		return 0, 0
+	}
+	old, rest, ok = cutLineNumber(rest, '-')
+	if !ok {
+		return 0, 0
+	}
+	new, _, ok = cutLineNumber(rest, '+')
+	if !ok {
+		return old, 0
+	}
+	return old, new
+}
+
+// cutLineNumber reads a "<sign><number>" field, tolerating the ",count" suffix
+// being present or absent — "@@ -1 +1 @@" is as valid as "@@ -1,4 +1,6 @@".
+func cutLineNumber(s string, sign byte) (n int, rest string, ok bool) {
+	i := strings.IndexByte(s, sign)
+	if i < 0 {
+		return 0, s, false
+	}
+	s = s[i+1:]
+	end := 0
+	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0, s, false
+	}
+	n, err := strconv.Atoi(s[:end])
+	if err != nil {
+		return 0, s, false
+	}
+	return n, s[end:], true
 }
 
 // Elision is one contiguous run of original diff lines that the reading diff
