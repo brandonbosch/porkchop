@@ -1,10 +1,14 @@
 package ui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"image/color"
 
-// styles is porkchop's whole visual vocabulary in one place. Colors are
-// AdaptiveColor so the view stays legible on both light and dark terminals;
-// Lip Gloss picks the right side from the detected background.
+	"charm.land/lipgloss/v2"
+)
+
+// styles is porkchop's whole visual vocabulary in one place. Every color is
+// picked from a light/dark pair so the view stays legible on both kinds of
+// terminal; which side wins is decided once, by the caller, and passed in.
 type styles struct {
 	add        lipgloss.Style // added lines (green)
 	del        lipgloss.Style // removed lines (red)
@@ -35,20 +39,30 @@ type styles struct {
 	footer     lipgloss.Style // the keybinding/scroll footer
 }
 
-func newStyles() styles {
+// newStyles resolves the palette against a known background. Taking `dark` as an
+// argument rather than detecting it here keeps this package free of terminal
+// I/O: Model starts on the dark palette (so offline golden rendering is
+// deterministic) and swaps once the real background arrives as a
+// tea.BackgroundColorMsg.
+func newStyles(dark bool) styles {
+	pick := lipgloss.LightDark(dark)
+	hex := func(light, dark string) color.Color {
+		return pick(lipgloss.Color(light), lipgloss.Color(dark))
+	}
+
 	var (
-		green   = lipgloss.AdaptiveColor{Light: "#1a7f37", Dark: "#3fb950"}
-		red     = lipgloss.AdaptiveColor{Light: "#cf222e", Dark: "#f85149"}
-		amber   = lipgloss.AdaptiveColor{Light: "#9a6700", Dark: "#d29922"}
-		magenta = lipgloss.AdaptiveColor{Light: "#8250df", Dark: "#bc8cff"}
-		cyan    = lipgloss.AdaptiveColor{Light: "#0969da", Dark: "#58a6ff"}
-		dim     = lipgloss.AdaptiveColor{Light: "#6e7781", Dark: "#8b949e"}
-		faint   = lipgloss.AdaptiveColor{Light: "#8c959f", Dark: "#6e7681"}
+		green   = hex("#1a7f37", "#3fb950")
+		red     = hex("#cf222e", "#f85149")
+		amber   = hex("#9a6700", "#d29922")
+		magenta = hex("#8250df", "#bc8cff")
+		cyan    = hex("#0969da", "#58a6ff")
+		dim     = hex("#6e7781", "#8b949e")
+		faint   = hex("#8c959f", "#6e7681")
 
 		// Muted polarity for revealed content: legible, but clearly a lower tier
 		// than the reading diff's own add/del.
-		mutedGreen = lipgloss.AdaptiveColor{Light: "#5a9367", Dark: "#2d6a35"}
-		mutedRed   = lipgloss.AdaptiveColor{Light: "#c08a8a", Dark: "#7d3b38"}
+		mutedGreen = hex("#5a9367", "#2d6a35")
+		mutedRed   = hex("#c08a8a", "#7d3b38")
 	)
 
 	tile := lipgloss.NewStyle().Padding(0, 1).MarginRight(1)

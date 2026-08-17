@@ -31,9 +31,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/brandonbosch/porkchop/internal/diffview"
 )
@@ -60,8 +60,11 @@ type Input struct {
 }
 
 // Run launches the review screen and blocks until the reviewer quits.
+//
+// Alt-screen and mouse reporting are not set here: in Bubble Tea v2 they are
+// properties of the view, declared in View below.
 func Run(in Input) error {
-	p := tea.NewProgram(New(in), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(New(in))
 	_, err := p.Run()
 	return err
 }
@@ -97,7 +100,13 @@ type Model struct {
 	ready  bool
 	width  int
 	height int
-	st     styles
+
+	// dark is the terminal background porkchop is painting for. It starts true
+	// and is corrected on the tea.BackgroundColorMsg that Init requests, so the
+	// palette is deterministic for offline rendering and still adapts on a real
+	// terminal. st is the palette resolved against it.
+	dark bool
+	st   styles
 }
 
 // bodyKind distinguishes the three kinds of line in the review view: rows that
@@ -131,7 +140,8 @@ func New(in Input) Model {
 		readingBytes: len(in.ReadingDiff),
 		rawBytes:     len(in.RawDiff),
 		cur:          -1,
-		st:           newStyles(),
+		dark:         true,
+		st:           newStyles(true),
 	}
 	m.rows = m.align.Rows
 
@@ -153,7 +163,9 @@ func New(in Input) Model {
 	return m
 }
 
-func (m Model) Init() tea.Cmd { return nil }
+// Init asks the terminal for its background color; the palette New assumed is
+// corrected when the answer arrives.
+func (m Model) Init() tea.Cmd { return tea.RequestBackgroundColor }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -162,7 +174,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.layout()
 		return m, nil
 
-	case tea.KeyMsg:
+	case tea.BackgroundColorMsg:
+		if dark := msg.IsDark(); dark != m.dark {
+			m.dark, m.st = dark, newStyles(dark)
+			if m.ready {
+				m.setContent()
+			}
+		}
+		return m, nil
+
+	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -209,11 +230,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m Model) View() string {
-	if !m.ready {
-		return "\n  initializing…"
+// View renders the frame and declares the terminal modes it needs. Alt-screen
+// and mouse reporting are view properties in Bubble Tea v2 rather than program
+// options, so they are stated here on every frame.
+func (m Model) View() tea.View {
+	content := "\n  initializing…"
+	if m.ready {
+		content = lipgloss.JoinVertical(lipgloss.Left, m.renderHeader(), m.vp.View(), m.renderFooter())
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, m.renderHeader(), m.vp.View(), m.renderFooter())
+	v := tea.NewView(content)
+	v.AltScreen = true
+	v.MouseMode = tea.MouseModeCellMotion
+	return v
 }
 
 // layout (re)sizes the viewport around the header and one-line footer and
@@ -224,12 +252,12 @@ func (m *Model) layout() {
 	const footerHeight = 1
 	body := max(m.height-headerHeight-footerHeight, 1)
 	if !m.ready {
-		m.vp = viewport.New(m.width, body)
+		m.vp = viewport.New(viewport.WithWidth(m.width), viewport.WithHeight(body))
 		m.vp.MouseWheelEnabled = true
 		m.ready = true
 	} else {
-		m.vp.Width = m.width
-		m.vp.Height = body
+		m.vp.SetWidth(m.width)
+		m.vp.SetHeight(body)
 	}
 	m.setContent()
 }
@@ -573,7 +601,7 @@ func (m *Model) setAudit(on bool) {
 		return
 	}
 	if on {
-		m.mainOffset = m.vp.YOffset
+		m.mainOffset = m.vp.YOffset()
 		m.audit = true
 		m.setContent()
 		m.vp.GotoTop()
@@ -644,7 +672,7 @@ func (m *Model) scrollToMark(i int) {
 	if !m.ready || i < 0 || i >= len(m.markerLine) {
 		return
 	}
-	m.vp.SetYOffset(max(m.markerLine[i]-m.vp.Height/3, 0))
+	m.vp.SetYOffset(max(m.markerLine[i]-m.vp.Height()/3, 0))
 }
 
 // expandTabs replaces tabs with spaces to the next multiple of tabWidth,
