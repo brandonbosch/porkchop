@@ -109,10 +109,10 @@ func main() {
 		renderJSON(res, elision)
 	case !*plain && isTerminal(os.Stdout):
 		if err := ui.Run(ui.Input{
-			Summary:      res.Summary,
-			Elision:      elision,
-			ReadingDiff:  res.SmartDiff,
-			RawDiffBytes: len(diff),
+			Summary:     res.Summary,
+			Elision:     elision,
+			ReadingDiff: res.SmartDiff,
+			RawDiff:     diff,
 		}); err != nil {
 			fatal("%v", err)
 		}
