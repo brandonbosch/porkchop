@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -141,16 +142,16 @@ func TestRenderFrameGoldens(t *testing.T) {
 	}
 }
 
-// alignedGoldens builds a Model per golden with its raw sibling attached, which
-// is the configuration every trust feature needs.
-func alignedGoldens(t *testing.T) map[string]Model {
+// goldenInputs is the Input per golden with its raw sibling attached, which is the
+// configuration every trust feature needs.
+func goldenInputs(t *testing.T) map[string]Input {
 	t.Helper()
 	dir := filepath.Join("..", "..", "meat", "testdata", "python")
 	matches, err := filepath.Glob(filepath.Join(dir, "*.golden.diff"))
 	if err != nil || len(matches) == 0 {
 		t.Fatalf("no golden diffs in %s (err=%v)", dir, err)
 	}
-	out := make(map[string]Model, len(matches))
+	out := make(map[string]Input, len(matches))
 	for _, path := range matches {
 		golden, err := os.ReadFile(path)
 		if err != nil {
@@ -161,51 +162,97 @@ func alignedGoldens(t *testing.T) map[string]Model {
 		if err != nil {
 			t.Fatalf("raw sibling for %s: %v", filepath.Base(path), err)
 		}
-		m := New(Input{
+		out[filepath.Base(path)] = Input{
 			Summary:     "test",
 			Elision:     meat.ElisionLine(string(raw), string(golden)),
 			ReadingDiff: string(golden),
 			RawDiff:     string(raw),
-		})
-		updated, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 40})
-		out[filepath.Base(path)] = updated.(Model)
+		}
+	}
+	return out
+}
+
+// alignedGoldens builds a laid-out Model per golden. The width is wide enough for
+// the split view, so these models are in it.
+func alignedGoldens(t *testing.T) map[string]Model {
+	t.Helper()
+	out := make(map[string]Model)
+	for name, in := range goldenInputs(t) {
+		updated, _ := New(in).Update(tea.WindowSizeMsg{Width: 200, Height: 40})
+		out[name] = updated.(Model)
 	}
 	return out
 }
 
 // TestRenderBodyPreservesRowsWithMarkers is the losslessness guarantee once
-// markers are in play. Markers add lines and a fold-marked elision's marker
-// stands in for meat's "..." row, so the body is no longer 1:1 with the rows —
-// but every row must still be accounted for exactly once and in order, either
-// rendered as itself or represented by the marker that replaced it.
+// markers are in play, checked in both views. Markers add lines and a fold-marked
+// elision's marker stands in for meat's "..." row, so the body is no longer 1:1
+// with the rows — but every row must still be accounted for exactly once, either
+// rendered as itself or represented by the marker that replaced it, and every
+// marker must appear exactly once whichever view is showing.
 func TestRenderBodyPreservesRowsWithMarkers(t *testing.T) {
-	for name, m := range alignedGoldens(t) {
-		t.Run(name, func(t *testing.T) {
-			if len(m.marks) == 0 {
-				t.Fatal("expected elision markers on an aligned golden")
-			}
-			var seen []int
-			for _, bl := range m.body {
-				if bl.row < 0 {
-					continue
+	for name, base := range alignedGoldens(t) {
+		for _, split := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/split=%v", name, split), func(t *testing.T) {
+				m := base
+				m.split = split
+				m.splitPinned = true
+				m.rebuild()
+
+				if len(m.marks) == 0 {
+					t.Fatal("expected elision markers on an aligned golden")
 				}
-				seen = append(seen, bl.row)
-				if bl.kind == bodyRow && bl.text != m.rows[bl.row].Text {
-					t.Errorf("row %d rendered text %q, want %q", bl.row, bl.text, m.rows[bl.row].Text)
+
+				seen := make([]int, len(m.rows))
+				marks := make([]int, len(m.marks))
+				for _, bl := range m.body {
+					for _, r := range bl.rows() {
+						seen[r]++
+					}
+					switch bl.kind {
+					case bodyRow:
+						if bl.text != m.rows[bl.row].Text {
+							t.Errorf("row %d rendered text %q, want %q", bl.row, bl.text, m.rows[bl.row].Text)
+						}
+					case bodyMarker:
+						marks[bl.mark]++
+						if bl.row >= 0 && m.rows[bl.row].Kind != diffview.RowFold {
+							t.Errorf("marker stands in for row %d, which is not a fold row", bl.row)
+						}
+					}
 				}
-				if bl.kind == bodyMarker && m.rows[bl.row].Kind != diffview.RowFold {
-					t.Errorf("marker stands in for row %d, which is not a fold row", bl.row)
+				for i, n := range seen {
+					if n != 1 {
+						t.Fatalf("row %d (%q) accounted for %d times, want 1", i, m.rows[i].Text, n)
+					}
 				}
-			}
-			if len(seen) != len(m.rows) {
-				t.Fatalf("body accounts for %d rows, want %d", len(seen), len(m.rows))
-			}
-			for i, got := range seen {
-				if got != i {
-					t.Fatalf("body row order diverges at position %d: got row %d", i, got)
+				for i, n := range marks {
+					if n != 1 {
+						t.Fatalf("mark %d drawn %d times, want 1", i, n)
+					}
 				}
-			}
-		})
+
+				// The old column never runs backward, and neither does the new one.
+				lastOld, lastNew := -1, -1
+				for _, bl := range m.body {
+					if bl.kind != bodyPair {
+						continue
+					}
+					if bl.left.Row >= 0 {
+						if bl.left.Row <= lastOld {
+							t.Fatalf("old column went backward: %d after %d", bl.left.Row, lastOld)
+						}
+						lastOld = bl.left.Row
+					}
+					if bl.right.Row >= 0 {
+						if bl.right.Row <= lastNew {
+							t.Fatalf("new column went backward: %d after %d", bl.right.Row, lastNew)
+						}
+						lastNew = bl.right.Row
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -438,21 +485,32 @@ func TestBackgroundColorRepalettes(t *testing.T) {
 	}
 }
 
-// sanity: the styler must handle every row kind without panicking.
-func TestRenderRowAllKinds(t *testing.T) {
-	m := New(Input{})
-	m.width = 80
-	for _, r := range []diffview.Row{
-		{Kind: diffview.RowMeta, Text: "diff --git a/x b/x"},
-		{Kind: diffview.RowMeta, Text: "index 1..2 100644"},
-		{Kind: diffview.RowHunk, Text: "@@ -1 +1 @@"},
-		{Kind: diffview.RowContext, Text: " ctx"},
-		{Kind: diffview.RowAdd, Text: "+add"},
-		{Kind: diffview.RowDel, Text: "-del"},
-		{Kind: diffview.RowFold, Text: "-    ..."},
-	} {
-		if got := m.renderRow(r); got == "" {
-			t.Errorf("renderRow(%v) returned empty", r.Kind)
+// sanity: every row kind must render in both views without panicking or coming
+// back blank.
+func TestRenderAllRowKinds(t *testing.T) {
+	diff := strings.Join([]string{
+		"diff --git a/x b/x",
+		"index 1..2 100644",
+		"--- a/x",
+		"+++ b/x",
+		"@@ -1,4 +1,4 @@",
+		" ctx",
+		"-del",
+		"+add",
+		"-    ...",
+		"\\ No newline at end of file",
+	}, "\n")
+
+	for _, split := range []bool{false, true} {
+		m := New(Input{ReadingDiff: diff})
+		m.width = 160
+		m.split = split
+		m.splitPinned = true
+		m.rebuild()
+		for i, bl := range m.body {
+			if got := m.renderBodyLine(i, bl); got == "" {
+				t.Errorf("split=%v: body line %d (%v) rendered empty", split, i, bl.kind)
+			}
 		}
 	}
 }
