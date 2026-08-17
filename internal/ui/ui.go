@@ -29,6 +29,7 @@ package ui
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"charm.land/bubbles/v2/viewport"
@@ -41,6 +42,16 @@ import (
 // tabWidth is the display width porkchop expands source tabs to. A fixed stop
 // keeps intra-line alignment predictable when measuring and truncating.
 const tabWidth = 4
+
+// minSplitWidth is the terminal width at which porkchop opens in the two-column
+// view instead of the unified one, and minColWidth the narrowest content column
+// worth putting a line of code in. Below either, the split is not a better way to
+// read the same diff — it is the same diff with less of each line visible — so the
+// unified view is chosen instead and `u` still overrides the choice by hand.
+const (
+	minSplitWidth = 120
+	minColWidth   = 24
+)
 
 // Input is everything the review screen needs, all derived upstream from the
 // raw diff and meat's Result.
@@ -75,8 +86,35 @@ type Model struct {
 	elision      string
 	align        diffview.Alignment
 	rows         []diffview.Row
+	lay          diffview.Layout
 	readingBytes int
 	rawBytes     int
+
+	// split is whether the two-column view is showing. It is chosen from the
+	// terminal width on the first layout and then left alone once the reviewer has
+	// pressed `u`, so a resize never undoes a deliberate choice.
+	split       bool
+	splitPinned bool
+
+	// numDigits is the width the line-number gutter needs, and 0 when porkchop has
+	// no exact numbers to show — see diffview.LineNo.
+	numDigits int
+
+	// files names each file in the diff and fileRows locates its header row, for
+	// the breadcrumb and for ]/[ stepping. rowFile indexes rows into files.
+	files    []string
+	fileRows []int
+	hunkRows []int
+	rowFile  []int
+
+	// Search. query is the committed or in-progress needle, hits every match on
+	// screen in reading order, and hitIndex the same matches keyed by content area
+	// so the painter can find a line's own without scanning.
+	searching bool
+	query     string
+	hits      []hit
+	hitIndex  map[int][]diffview.Span
+	hitCur    int
 
 	// marks are the elisions that get a marker, in reading order; expanded is
 	// parallel to it. cur is the marker `e` acts on, or -1 when there are none.
@@ -89,9 +127,11 @@ type Model struct {
 	contextOnly int
 
 	// body is the rendered review view as semantic lines; markerLine maps each
-	// mark to its line index in body, for scrolling to it.
+	// mark to its line index in body, and rowLine each row to the line it is shown
+	// on, both so a jump can be turned into a scroll offset.
 	body       []bodyLine
 	markerLine []int
+	rowLine    []int
 
 	audit      bool
 	mainOffset int
@@ -118,6 +158,9 @@ const (
 	bodyRow bodyKind = iota
 	bodyMarker
 	bodyHidden
+	// bodyPair is one line of the two-column view, carrying a cell per side. It
+	// replaces bodyRow for source lines when the split view is showing.
+	bodyPair
 )
 
 // bodyLine is one line of the review view before styling. row and mark are
@@ -128,6 +171,39 @@ type bodyLine struct {
 	row  int
 	mark int
 	text string
+	// left and right are the two columns of a bodyPair, either of which may be
+	// filler (Row < 0). They are unset for every other kind.
+	left  diffview.Cell
+	right diffview.Cell
+}
+
+// rows returns the row indices this line accounts for, which is what lets a test
+// assert the body neither drops nor duplicates any of them.
+func (bl bodyLine) rows() []int {
+	if bl.kind != bodyPair {
+		if bl.row >= 0 {
+			return []int{bl.row}
+		}
+		return nil
+	}
+	var out []int
+	if bl.left.Row >= 0 {
+		out = append(out, bl.left.Row)
+	}
+	if bl.right.Row >= 0 && bl.right.Row != bl.left.Row {
+		out = append(out, bl.right.Row)
+	}
+	return out
+}
+
+// firstRow is the lowest row this line shows, or -1 for a line that shows none.
+// It is what "where am I" means for the breadcrumb and for ]/[ stepping.
+func (bl bodyLine) firstRow() int {
+	rows := bl.rows()
+	if len(rows) == 0 {
+		return -1
+	}
+	return min(rows[0], rows[len(rows)-1])
 }
 
 // New builds a Model from Input, aligning the reading diff against its original
@@ -140,10 +216,14 @@ func New(in Input) Model {
 		readingBytes: len(in.ReadingDiff),
 		rawBytes:     len(in.RawDiff),
 		cur:          -1,
+		hitCur:       -1,
 		dark:         true,
 		st:           newStyles(true),
 	}
 	m.rows = m.align.Rows
+	m.lay = diffview.Split(m.rows)
+	m.numDigits = numberWidth(m.align.Nums)
+	m.indexFiles()
 
 	// A marker is worth drawing when the elision hides real change, or when meat
 	// itself flagged it — in which case hiding the flag would be a regression
@@ -184,17 +264,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyPressMsg:
+		// While the query prompt is open it owns the keyboard: a reviewer typing
+		// "quit" into the search box must not quit.
+		if m.searching {
+			return m.updateSearch(msg)
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 		case "esc":
-			if m.audit {
+			// esc unwinds one layer at a time — first the search, then the audit
+			// view — and only quits when there is nothing left to back out of.
+			switch {
+			case m.searchActive():
+				m.clearSearch()
+			case m.audit:
 				m.setAudit(false)
-				return m, nil
+			default:
+				return m, tea.Quit
 			}
-			return m, tea.Quit
+			return m, nil
 		case "a":
 			m.setAudit(!m.audit)
+			return m, nil
+		case "u":
+			m.toggleSplit()
+			return m, nil
+		case "/":
+			m.openSearch()
 			return m, nil
 		case "j":
 			m.vp.ScrollDown(1)
@@ -208,10 +305,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "G", "end":
 			m.vp.GotoBottom()
 			return m, nil
+		case "]":
+			m.stepAnchor(m.fileRows, 1)
+			return m, nil
+		case "[":
+			m.stepAnchor(m.fileRows, -1)
+			return m, nil
+		case "}":
+			m.stepAnchor(m.hunkRows, 1)
+			return m, nil
+		case "{":
+			m.stepAnchor(m.hunkRows, -1)
+			return m, nil
 		case "n":
+			// n/N step search matches while a search is live and elisions
+			// otherwise, which is what a pager-literate reviewer expects. The
+			// footer always names which of the two is bound.
+			if m.searchActive() {
+				m.stepHit(1)
+				return m, nil
+			}
 			m.stepMark(1)
 			return m, nil
-		case "p", "N":
+		case "N":
+			if m.searchActive() {
+				m.stepHit(-1)
+				return m, nil
+			}
+			m.stepMark(-1)
+			return m, nil
+		case "p":
 			m.stepMark(-1)
 			return m, nil
 		case "e":
@@ -248,6 +371,11 @@ func (m Model) View() tea.View {
 // refreshes its content. The header height is measured from the same
 // renderHeader View() uses, so they never disagree.
 func (m *Model) layout() {
+	// The view is chosen from the width until the reviewer chooses for themselves,
+	// after which the choice stands through any resize.
+	if !m.splitPinned {
+		m.split = m.splitViable()
+	}
 	headerHeight := lipgloss.Height(m.renderHeader())
 	const footerHeight = 1
 	body := max(m.height-headerHeight-footerHeight, 1)
@@ -259,6 +387,9 @@ func (m *Model) layout() {
 		m.vp.SetWidth(m.width)
 		m.vp.SetHeight(body)
 	}
+	// Both the line model and the search offsets are functions of the width, so a
+	// resize has to rebuild them rather than just re-clip what is there.
+	m.rebuild()
 	m.setContent()
 }
 
@@ -270,61 +401,129 @@ func (m *Model) setContent() {
 	m.vp.SetContent(m.renderBody())
 }
 
-// rebuild recomputes the review view's line model. Called whenever expansion
-// state changes, since expanding a marker splices original lines into the body.
+// rebuild recomputes the review view's line model. Called whenever the expansion
+// state or the view changes, since either alters which lines the body holds.
 func (m *Model) rebuild() {
 	m.body = m.buildBody()
 	m.markerLine = make([]int, len(m.marks))
+	m.rowLine = make([]int, len(m.rows))
+	for i := range m.rowLine {
+		m.rowLine[i] = -1
+	}
 	for i, bl := range m.body {
 		if bl.kind == bodyMarker && bl.mark >= 0 {
 			m.markerLine[bl.mark] = i
 		}
+		for _, r := range bl.rows() {
+			m.rowLine[r] = i
+		}
 	}
+	// Matches are found against the body as just built, so they must be refreshed
+	// with it or their offsets would refer to lines that have moved.
+	m.findHits()
 }
 
-// buildBody walks the reading diff's rows in order, splicing in a marker at each
-// elision and, where expanded, the original lines that elision hides.
+func (m *Model) buildBody() []bodyLine {
+	if m.split {
+		return m.buildSplitBody()
+	}
+	return m.buildUnifiedBody()
+}
+
+// buildUnifiedBody walks the reading diff's rows in order, splicing in a marker at
+// each elision and, where expanded, the original lines that elision hides.
 //
 // An elision meat marked with a "..." row is rendered *as* that row's
 // replacement — the marker says "12 changed lines hidden", which strictly
 // dominates what "..." conveys — so each row still appears exactly once, either
 // as itself or as the marker standing in for it.
-func (m *Model) buildBody() []bodyLine {
+func (m *Model) buildUnifiedBody() []bodyLine {
 	out := make([]bodyLine, 0, len(m.rows)+len(m.marks))
 
 	atFold := make(map[int]int, len(m.marks))
-	atBefore := make(map[int]int, len(m.marks))
+	atBefore := make(map[int][]int, len(m.marks))
 	for i, e := range m.marks {
 		if e.FoldRow >= 0 {
 			atFold[e.FoldRow] = i
-		} else {
-			atBefore[e.BeforeRow] = i
+			continue
 		}
-	}
-
-	emit := func(mark, row int) {
-		out = append(out, bodyLine{kind: bodyMarker, row: row, mark: mark, text: m.markerText(mark)})
-		if !m.expanded[mark] {
-			return
-		}
-		for _, line := range m.align.Hidden(m.marks[mark]) {
-			out = append(out, bodyLine{kind: bodyHidden, row: -1, mark: mark, text: line})
-		}
+		atBefore[e.BeforeRow] = append(atBefore[e.BeforeRow], i)
 	}
 
 	for i, r := range m.rows {
-		if mark, ok := atBefore[i]; ok {
-			emit(mark, -1)
+		for _, mark := range atBefore[i] {
+			out = m.emitMark(out, mark, -1)
 		}
 		if mark, ok := atFold[i]; ok {
-			emit(mark, i)
+			out = m.emitMark(out, mark, i)
 			continue
 		}
 		out = append(out, bodyLine{kind: bodyRow, row: i, mark: -1, text: r.Text})
 	}
 	// An elision after the last row anchors at len(rows).
-	if mark, ok := atBefore[len(m.rows)]; ok {
-		emit(mark, -1)
+	for _, mark := range atBefore[len(m.rows)] {
+		out = m.emitMark(out, mark, -1)
+	}
+	return out
+}
+
+// buildSplitBody is the same splice against the two-column layout.
+//
+// Markers are anchored to rows while the layout is a list of lines, so each
+// anchor is resolved through the row-to-line map. The consequence is that a
+// marker whose anchor falls inside a change block attaches to that block rather
+// than appearing between its two columns, which is the only available reading: the
+// columns of a pair are the same moment of the change, and there is no "between"
+// for a full-width row to occupy.
+func (m *Model) buildSplitBody() []bodyLine {
+	out := make([]bodyLine, 0, len(m.lay.Lines)+len(m.marks))
+
+	lineOf := m.lay.LineOfRow()
+	atFold := make(map[int]int, len(m.marks))
+	atBefore := make(map[int][]int, len(m.marks))
+	var trailing []int
+	for i, e := range m.marks {
+		switch {
+		case e.FoldRow >= 0 && e.FoldRow < len(lineOf) && lineOf[e.FoldRow] >= 0:
+			atFold[lineOf[e.FoldRow]] = i
+		case e.BeforeRow >= 0 && e.BeforeRow < len(lineOf) && lineOf[e.BeforeRow] >= 0:
+			at := lineOf[e.BeforeRow]
+			atBefore[at] = append(atBefore[at], i)
+		default:
+			// An elision past the last row, or one whose anchor no layout line
+			// claims, goes at the end rather than being dropped.
+			trailing = append(trailing, i)
+		}
+	}
+
+	for li, l := range m.lay.Lines {
+		for _, mark := range atBefore[li] {
+			out = m.emitMark(out, mark, -1)
+		}
+		if mark, ok := atFold[li]; ok {
+			out = m.emitMark(out, mark, l.Row)
+			continue
+		}
+		if l.Kind == diffview.SplitFull {
+			out = append(out, bodyLine{kind: bodyRow, row: l.Row, mark: -1, text: m.rows[l.Row].Text})
+			continue
+		}
+		out = append(out, bodyLine{kind: bodyPair, row: -1, mark: -1, left: l.Left, right: l.Right})
+	}
+	for _, mark := range trailing {
+		out = m.emitMark(out, mark, -1)
+	}
+	return out
+}
+
+// emitMark appends a marker and, when it is expanded, the original lines it hides.
+func (m *Model) emitMark(out []bodyLine, mark, row int) []bodyLine {
+	out = append(out, bodyLine{kind: bodyMarker, row: row, mark: mark, text: m.markerText(mark)})
+	if !m.expanded[mark] {
+		return out
+	}
+	for _, line := range m.align.Hidden(m.marks[mark]) {
+		out = append(out, bodyLine{kind: bodyHidden, row: -1, mark: mark, text: line})
 	}
 	return out
 }
@@ -342,12 +541,12 @@ func (m Model) markerText(i int) string {
 	var what string
 	switch {
 	case e.Changed > 0:
-		what = fmt.Sprintf("%d changed lines", e.Changed)
-		if e.Len() > e.Changed {
-			what += fmt.Sprintf(" (+%d context)", e.Len()-e.Changed)
+		what = fmt.Sprintf("%d changed %s", e.Changed, plural(e.Changed, "line", "lines"))
+		if n := e.Len() - e.Changed; n > 0 {
+			what += fmt.Sprintf(" (+%d context)", n)
 		}
 	default:
-		what = fmt.Sprintf("%d context lines", e.Len())
+		what = fmt.Sprintf("%d context %s", e.Len(), plural(e.Len(), "line", "lines"))
 	}
 	if !m.expanded[i] {
 		what += " hidden"
@@ -361,33 +560,9 @@ func (m Model) renderBody() string {
 		if i > 0 {
 			b.WriteByte('\n')
 		}
-		b.WriteString(m.renderBodyLine(bl))
+		b.WriteString(m.renderBodyLine(i, bl))
 	}
 	return b.String()
-}
-
-func (m Model) renderBodyLine(bl bodyLine) string {
-	switch bl.kind {
-	case bodyMarker:
-		// The current marker carries a caret; others get matching blanks so the
-		// marker text stays in one column as the cursor moves.
-		prefix := "  "
-		style := m.st.marker
-		if bl.mark == m.cur {
-			prefix = "❯ "
-			style = m.st.markerCur
-		}
-		return m.clamp(style).Render(prefix + bl.text)
-
-	case bodyHidden:
-		// Expanded original content is set apart by a gutter and dimmed: this is
-		// what the model judged noise, shown for checking, not for reading.
-		text := expandTabs(bl.text, tabWidth)
-		return m.clamp(m.st.hiddenGutter).Render("│") + m.clamp(m.hiddenStyle(bl.text)).Render(text)
-
-	default:
-		return m.renderRow(m.rows[bl.row])
-	}
 }
 
 // hiddenStyle keeps polarity legible inside expanded content without letting it
@@ -401,32 +576,6 @@ func (m Model) hiddenStyle(line string) lipgloss.Style {
 	default:
 		return m.st.hidden
 	}
-}
-
-func (m Model) renderRow(r diffview.Row) string {
-	text := expandTabs(r.Text, tabWidth)
-	var style lipgloss.Style
-	switch r.Kind {
-	case diffview.RowAdd:
-		style = m.st.add
-	case diffview.RowDel:
-		style = m.st.del
-	case diffview.RowFold:
-		style = m.st.fold
-	case diffview.RowHunk:
-		style = m.st.hunk
-	case diffview.RowMeta:
-		// The per-file "diff --git" header is a navigational anchor; make it
-		// bolder than the index/---/+++ noise around it.
-		if strings.HasPrefix(text, "diff --git ") {
-			style = m.st.fileHeader
-		} else {
-			style = m.st.meta
-		}
-	default:
-		style = m.st.context
-	}
-	return m.clamp(style).Render(text)
 }
 
 // clamp hard-truncates to the terminal width so a long source line clips
@@ -570,19 +719,96 @@ func (m Model) renderHeader() string {
 		tiles = append(tiles, m.st.tile.Render(fmt.Sprintf("%d rows", len(m.rows))))
 	}
 	bar := lipgloss.JoinHorizontal(lipgloss.Top, tiles...)
-	return lipgloss.JoinVertical(lipgloss.Left, title, bar, m.st.rule.Render(strings.Repeat("─", max(m.width, 1))))
+	return lipgloss.JoinVertical(lipgloss.Left, title, bar, m.renderRule())
 }
 
+// renderRule is the divider under the header, carrying the name of the file the
+// reviewer is currently inside. The breadcrumb goes in the rule because it costs
+// no vertical space there, and on a 15-file change knowing which file you are
+// looking at is not optional — but neither is a line of diff.
+func (m Model) renderRule() string {
+	w := max(m.width, 1)
+	label := m.currentFile()
+	const lead = 2
+	// Fall back to a plain rule when the name would leave no rule to speak of.
+	if label == "" || w < lead+lipgloss.Width(label)+6 {
+		return m.st.rule.Render(strings.Repeat("─", w))
+	}
+	tail := w - lead - lipgloss.Width(label) - 2
+	return m.st.rule.Render(strings.Repeat("─", lead)) + " " +
+		m.st.breadcrumb.Render(label) + " " +
+		m.st.rule.Render(strings.Repeat("─", max(tail, 0)))
+}
+
+// currentFileIndex is which file the top of the viewport is inside.
+func (m Model) currentFileIndex() int {
+	if row := m.topRow(); row >= 0 && row < len(m.rowFile) && m.rowFile[row] >= 0 {
+		return m.rowFile[row]
+	}
+	return 0
+}
+
+// currentFile names the file at the top of the viewport and its position in the
+// change.
+func (m Model) currentFile() string {
+	if len(m.files) == 0 {
+		return ""
+	}
+	idx := m.currentFileIndex()
+	name := m.files[idx]
+	if name == "" {
+		name = "(unnamed)"
+	}
+	return fmt.Sprintf("%s  (%d/%d)", name, idx+1, len(m.files))
+}
+
+// otherView is what `u` would switch to, so the footer can say what the key does
+// rather than what the state already is.
+func (m Model) otherView() string {
+	if m.split {
+		return "unified"
+	}
+	return "split"
+}
+
+// renderFooter is the keybinding line, in a long form when there is room for it
+// and a short one when there is not. Two tiers rather than a per-hint fit: the
+// hints a reviewer needs at 80 columns are not the tail of the list they need at
+// 200, they are a different list.
 func (m Model) renderFooter() string {
+	if m.searching {
+		hint := "type to search · esc cancel"
+		if m.query != "" {
+			hint = fmt.Sprintf("%d %s · enter keep · esc cancel",
+				len(m.hits), plural(len(m.hits), "match", "matches"))
+		}
+		line := m.renderPrompt() + "  " + m.st.footer.Render(hint)
+		return lipgloss.NewStyle().MaxWidth(max(m.width, 1)).Render(line)
+	}
+
+	wide := m.width >= 100
 	var help string
 	switch {
 	case m.audit:
 		help = "j/k scroll · a/esc back to review · q quit"
+	case m.searchActive():
+		help = fmt.Sprintf("n/N match (%d/%d) · esc clear · q quit", m.hitCur+1, len(m.hits))
+		if wide {
+			help = fmt.Sprintf("n/N match (%d/%d) · esc clear · ]/[ file · u %s · a audit · q quit",
+				m.hitCur+1, len(m.hits), m.otherView())
+		}
 	case len(m.marks) == 0:
-		help = "j/k scroll · g/G top/bottom · a audit · q quit"
+		help = "j/k scroll · / search · q quit"
+		if wide {
+			help = fmt.Sprintf("j/k scroll · g/G top/bottom · ]/[ file · }/{ hunk · / search · u %s · a audit · q quit",
+				m.otherView())
+		}
 	default:
-		help = fmt.Sprintf("j/k scroll · n/p elision (%d/%d) · e expand · E all · a audit · q quit",
-			m.cur+1, len(m.marks))
+		help = fmt.Sprintf("n/p elision (%d/%d) · e expand · / search · q quit", m.cur+1, len(m.marks))
+		if wide {
+			help = fmt.Sprintf("n/p elision (%d/%d) · e expand · E all · ]/[ file · }/{ hunk · / search · u %s · a audit · q quit",
+				m.cur+1, len(m.marks), m.otherView())
+		}
 	}
 
 	pct := 0
@@ -610,6 +836,111 @@ func (m *Model) setAudit(on bool) {
 	m.audit = false
 	m.setContent()
 	m.vp.SetYOffset(m.mainOffset)
+}
+
+// numberWidth is how many digits the line-number gutter needs, and 0 when there
+// are no numbers to show at all.
+func numberWidth(nums []diffview.LineNo) int {
+	high := 0
+	for _, n := range nums {
+		high = max(high, n.Old, n.New)
+	}
+	if high == 0 {
+		return 0
+	}
+	return len(strconv.Itoa(high))
+}
+
+// indexFiles labels every row with the file it belongs to and records where each
+// file's header and each hunk header sits, which is what ]/[ and }/{ step between
+// and what the breadcrumb reads.
+func (m *Model) indexFiles() {
+	m.rowFile = make([]int, len(m.rows))
+	cur := -1
+	for i, r := range m.rows {
+		switch {
+		case r.Kind == diffview.RowHunk:
+			m.hunkRows = append(m.hunkRows, i)
+		case r.Kind == diffview.RowMeta && strings.HasPrefix(r.Text, "diff --git "):
+			cur = len(m.files)
+			name, _ := diffview.FileOf(r.Text)
+			m.files = append(m.files, name)
+			m.fileRows = append(m.fileRows, i)
+		case r.Kind == diffview.RowMeta && strings.HasPrefix(r.Text, "+++ ") && cur >= 0:
+			// "+++ b/path" names exactly one path, so it is preferred over the
+			// two-path "diff --git" line whenever it turns up.
+			if name, ok := diffview.FileOf(r.Text); ok {
+				m.files[cur] = name
+			}
+		}
+		m.rowFile[i] = cur
+	}
+}
+
+// topRow is the first row at or below the top of the viewport — what "where the
+// reviewer is" means for the breadcrumb and for anchor stepping.
+func (m Model) topRow() int {
+	for i := m.vp.YOffset(); i < len(m.body); i++ {
+		if r := m.body[i].firstRow(); r >= 0 {
+			return r
+		}
+	}
+	return len(m.rows)
+}
+
+// stepAnchor jumps to the next or previous row in a sorted list of anchors — file
+// headers or hunk headers. It clamps at the ends rather than wrapping, matching
+// elision stepping so that holding a key settles instead of cycling.
+func (m *Model) stepAnchor(anchors []int, delta int) {
+	if len(anchors) == 0 || m.audit {
+		return
+	}
+	from := m.topRow()
+	target := anchors[0]
+	if delta > 0 {
+		target = anchors[len(anchors)-1]
+		for _, a := range anchors {
+			if a > from {
+				target = a
+				break
+			}
+		}
+	} else {
+		for i := len(anchors) - 1; i >= 0; i-- {
+			if anchors[i] < from {
+				target = anchors[i]
+				break
+			}
+		}
+	}
+	m.jumpToRow(target)
+}
+
+// jumpToRow scrolls so a row sits at the top of the viewport. Headers are what
+// this is used for, and a header belongs at the top of what it heads.
+func (m *Model) jumpToRow(row int) {
+	if !m.ready || row < 0 || row >= len(m.rowLine) {
+		return
+	}
+	if line := m.rowLine[row]; line >= 0 {
+		m.vp.SetYOffset(line)
+	}
+}
+
+// toggleSplit switches between the unified and two-column views, keeping whatever
+// row was at the top of the screen at the top of the screen so the reviewer does
+// not lose their place. The choice is pinned once made by hand, so a later resize
+// will not silently undo it.
+func (m *Model) toggleSplit() {
+	if m.audit {
+		return
+	}
+	anchor := m.topRow()
+	m.split = !m.split
+	m.splitPinned = true
+	m.rebuild()
+	m.setContent()
+	m.jumpToRow(anchor)
 }
 
 // stepMark moves the cursor to the next or previous elision marker and scrolls
@@ -673,27 +1004,6 @@ func (m *Model) scrollToMark(i int) {
 		return
 	}
 	m.vp.SetYOffset(max(m.markerLine[i]-m.vp.Height()/3, 0))
-}
-
-// expandTabs replaces tabs with spaces to the next multiple of tabWidth,
-// tracking column position so alignment survives the expansion.
-func expandTabs(s string, width int) string {
-	if !strings.ContainsRune(s, '\t') {
-		return s
-	}
-	var b strings.Builder
-	col := 0
-	for _, r := range s {
-		if r == '\t' {
-			n := width - col%width
-			b.WriteString(strings.Repeat(" ", n))
-			col += n
-			continue
-		}
-		b.WriteRune(r)
-		col++
-	}
-	return b.String()
 }
 
 func plural(n int, one, many string) string {
