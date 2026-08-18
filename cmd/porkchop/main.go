@@ -19,8 +19,9 @@
 //	porkchop process [rev]   Abridge and cache without opening anything.
 //	porkchop hook install    Warm the cache from a post-commit hook.
 //
-// It reads OPENAI_API_KEY or ANTHROPIC_API_KEY from the environment (optionally
-// the matching provider base URL, plus MEAT_MODEL / -model), exactly like meat.
+// Inference goes through internal/model, which defaults to Claude on AWS
+// Bedrock. Reaching a public API is possible but never implicit: it takes
+// -provider anthropic (or openai, or openai-compat for a local server).
 package main
 
 import (
@@ -33,6 +34,7 @@ import (
 	"time"
 
 	"github.com/brandonbosch/porkchop/internal/gitx"
+	"github.com/brandonbosch/porkchop/internal/model"
 	"github.com/brandonbosch/porkchop/internal/store"
 	"github.com/brandonbosch/porkchop/internal/ui"
 	"github.com/brandonbosch/porkchop/meat"
@@ -73,7 +75,16 @@ Per-file "viewed" markers (v in the TUI) persist under the cache directory, keye
 to each file's own content, so they survive a range growing as an agent commits.
 
 Flags:
-  -model string   Model to use (default $MEAT_MODEL or a built-in default).
+  -provider name  Inference backend: bedrock (default), anthropic, openai,
+                  openai-compat. Bedrock is the default because everything sent
+                  to a model here — the diff, and the surrounding source meat's
+                  tools read — is assumed to be CUI; a public API takes asking.
+  -model string   Model id (default $PORKCHOP_MODEL, then $MEAT_MODEL). Bedrock
+                  needs a full inference profile id and has no default, because
+                  the id is passed through verbatim and forms the cache key.
+  -region string  AWS region for bedrock (default $PORKCHOP_BEDROCK_REGION or
+                  your AWS config).
+  -base-url url   Endpoint override; required for openai-compat.
   -no-cache       Ignore any cached result and recompute (still updates cache).
   -staged         Review the staged changes (git diff --staged).
   -w              Review the unstaged working-tree changes (git diff).
@@ -86,9 +97,16 @@ Flags:
   -h, --help      Show this help.
 
 Environment:
-  OPENAI_API_KEY / ANTHROPIC_API_KEY   API key for the selected provider.
-  OPENAI_BASE_URL / ANTHROPIC_BASE_URL Optional provider base-URL overrides.
-  MEAT_MODEL                           Optional default model id.
+  PORKCHOP_PROVIDER                    Default backend (see -provider).
+  PORKCHOP_MODEL                       Default model id; read before MEAT_MODEL,
+                                       so a machine that also runs plain meat can
+                                       point porkchop at a Bedrock profile.
+  PORKCHOP_BEDROCK_REGION              Default AWS region for bedrock.
+  PORKCHOP_BASE_URL                    Default endpoint for openai-compat.
+  AWS_PROFILE / AWS_REGION / ~/.aws    Bedrock credentials, via the standard AWS
+                                       chain (SSO, assume-role, env, IMDS).
+  ANTHROPIC_API_KEY / OPENAI_API_KEY   API key, for those providers only.
+  MEAT_MODEL                           Fallback default model id.
   MEAT_CACHE                           Optional cache dir (default ~/.meat; empty disables).
 `
 
@@ -178,7 +196,7 @@ func runReview(args []string) {
 	fs := flag.NewFlagSet("porkchop", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
-	model := fs.String("model", "", "model to use (default $MEAT_MODEL or built-in default)")
+	backend := addBackendFlags(fs)
 	noCache := fs.Bool("no-cache", false, "ignore any cached result and recompute (still updates the cache)")
 	staged := fs.Bool("staged", false, "read the staged changes (git diff --staged)")
 	worktree := fs.Bool("w", false, "read the unstaged working-tree changes (git diff)")
@@ -202,7 +220,7 @@ func runReview(args []string) {
 	if *readingDiffFile != "" {
 		diff, res = loadReadingDiff(*readingDiffFile)
 	} else {
-		diff, res = computeResult(fs.Args(), *staged, *worktree, *model, *noCache, *jsonOut)
+		diff, res = computeResult(fs.Args(), *staged, *worktree, backend.config(), *noCache, *jsonOut)
 	}
 
 	elision := meat.ElisionLine(diff, res.SmartDiff)
@@ -227,7 +245,7 @@ func runReview(args []string) {
 // computeResult reads the raw diff for the given selection and returns it with
 // meat's abridged result, hitting the shared ~/.meat cache first and computing
 // via the LLM (needs credentials) only on a miss.
-func computeResult(args []string, staged, worktree bool, model string, noCache, jsonOut bool) (string, *meat.Result) {
+func computeResult(args []string, staged, worktree bool, backend model.Config, noCache, jsonOut bool) (string, *meat.Result) {
 	diff, source, err := gitx.ReadDiff(args, staged, worktree)
 	if err != nil {
 		fatalReadDiff(args, err)
@@ -245,8 +263,16 @@ func computeResult(args []string, staged, worktree bool, model string, noCache, 
 	}
 
 	ctx := context.Background()
+	// Resolve the backend before touching the cache: the model id is part of
+	// the key, so a Bedrock inference profile and a public claude-opus-4-8 are
+	// distinct entries and cannot collide. Resolution is offline — no
+	// credentials are touched until there is actually work to do.
+	backend, err = model.Resolve(backend)
+	if err != nil {
+		fatal("%v", err)
+	}
 	dir := store.Dir()
-	key := store.Key(diff, meat.ResolveModel(model), meat.RubricHash())
+	key := store.Key(diff, backend.Model, meat.RubricHash())
 
 	if !noCache {
 		if cached, ok := store.Load(dir, key); ok {
@@ -254,7 +280,7 @@ func computeResult(args []string, staged, worktree bool, model string, noCache, 
 		}
 	}
 
-	m, err := meat.NewModelFromEnv(ctx, model)
+	m, err := model.Open(ctx, backend)
 	if err != nil {
 		fatal("%v", err)
 	}
