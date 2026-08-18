@@ -576,6 +576,16 @@ func (m Model) markerText(i int) string {
 
 	var what string
 	switch {
+	case e.Changed > 0 && e.Blank == e.Changed:
+		// Everything this marker hides is an empty line. Saying so costs the same
+		// row and tells the reviewer there is nothing behind it, rather than
+		// inviting an expand that reveals whitespace. The marker is still drawn and
+		// still counted, so the header's "N hidden in M spots" continues to
+		// reconcile with what is on screen — suppressing it would not.
+		what = fmt.Sprintf("%d blank %s", e.Blank, plural(e.Blank, "line", "lines"))
+		if n := e.Len() - e.Changed; n > 0 {
+			what += fmt.Sprintf(" (+%d context)", n)
+		}
 	case e.Changed > 0:
 		what = fmt.Sprintf("%d changed %s", e.Changed, plural(e.Changed, "line", "lines"))
 		if n := e.Len() - e.Changed; n > 0 {

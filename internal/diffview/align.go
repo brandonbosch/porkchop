@@ -326,6 +326,14 @@ type Elision struct {
 	// opposed to context meat merely trimmed. It is what makes an elision worth
 	// a reviewer's attention, and what the marker reports.
 	Changed int
+	// Blank counts how many of those Changed lines have no content at all — an
+	// added or removed empty line. When Blank equals Changed the elision hides
+	// nothing a reviewer can read, which is worth saying in the marker: about one
+	// marker in five across meat/testdata is this case, and a marker that costs a
+	// row of screen to reveal whitespace teaches a reviewer to distrust the expand
+	// affordance. It changes wording only; Changed, and every count derived from
+	// it, is untouched.
+	Blank int
 	// File is the path of the file this elision falls in, taken from the raw
 	// diff's own headers, so the audit view can group the discard pile by file.
 	// It is empty when the elision precedes any file header.
@@ -384,8 +392,12 @@ func (a *Alignment) newElision(rawRows []Row, files []string, lo, hi, prevRow, b
 		e.File = files[lo]
 	}
 	for i := lo; i < hi; i++ {
-		if isChangedLine(rawRows[i]) {
-			e.Changed++
+		if !isChangedLine(rawRows[i]) {
+			continue
+		}
+		e.Changed++
+		if isBlankChange(rawRows[i]) {
+			e.Blank++
 		}
 	}
 	for r := prevRow + 1; r < beforeRow && r < len(a.Rows); r++ {
@@ -412,6 +424,17 @@ func isChangedLine(r Row) bool {
 		return r.Text != "" && (r.Text[0] == '+' || r.Text[0] == '-')
 	}
 	return false
+}
+
+// isBlankChange reports whether a changed raw row adds or removes a line with no
+// content — nothing but its +/- marker, or that marker and whitespace.
+//
+// Whitespace-only counts as blank because the judgement being made is "is there
+// anything here for a reviewer to read", and for a whole hidden line there is not.
+// This affects how a marker is worded and nothing else; the line is still counted
+// as changed everywhere it matters.
+func isBlankChange(r Row) bool {
+	return len(r.Text) > 0 && strings.TrimSpace(r.Text[1:]) == ""
 }
 
 // isHunkSource reports whether a kind is a source line inside a hunk body, the

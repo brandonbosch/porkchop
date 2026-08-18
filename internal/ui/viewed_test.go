@@ -330,3 +330,48 @@ func TestHeaderAndFooterFitTheWidth(t *testing.T) {
 		}
 	}
 }
+
+// TestBlankOnlyMarkerSaysSo covers the wording change: a marker whose hidden changed
+// lines are all empty says "blank", so a reviewer knows not to spend an expand on it.
+// The marker is still drawn and still counted — suppressing it would put the header's
+// "N hidden in M spots" out of step with what is on screen.
+func TestBlankOnlyMarkerSaysSo(t *testing.T) {
+	for name, m := range alignedGoldens(t) {
+		t.Run(name, func(t *testing.T) {
+			blankOnly, mixed := 0, 0
+			for i, e := range m.marks {
+				text := m.markerText(i)
+				switch {
+				case e.Changed > 0 && e.Blank == e.Changed:
+					blankOnly++
+					if !strings.Contains(text, "blank") {
+						t.Errorf("mark %d hides %d blank lines but reads %q", i, e.Blank, text)
+					}
+					if strings.Contains(text, "changed") {
+						t.Errorf("mark %d reads %q, which invites an expand that reveals nothing", i, text)
+					}
+					if want := fmt.Sprintf("%d blank", e.Blank); !strings.Contains(text, want) {
+						t.Errorf("mark %d does not carry %q: %q", i, want, text)
+					}
+				case e.Changed > 0:
+					mixed++
+					// A marker hiding any real content must keep saying "changed",
+					// even when some of what it hides is blank.
+					if !strings.Contains(text, "changed") {
+						t.Errorf("mark %d hides %d changed lines (%d blank) but reads %q",
+							i, e.Changed, e.Blank, text)
+					}
+				}
+			}
+			if blankOnly == 0 || mixed == 0 {
+				t.Skipf("golden has %d blank-only and %d substantive markers", blankOnly, mixed)
+			}
+
+			// The header's accounting is wording-independent: every marker still
+			// counts, blank or not.
+			if got := ansi.Strip(m.renderHeader()); !strings.Contains(got, fmt.Sprintf("in %d spots", len(m.marks))) {
+				t.Errorf("header no longer reconciles with the marker count:\n%s", got)
+			}
+		})
+	}
+}
