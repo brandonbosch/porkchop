@@ -34,6 +34,9 @@ An empty diff is success, not an error: a commit that changed nothing is a
 perfectly good thing for a hook to encounter.
 
 Flags:
+  -preset name    Named backend preset from ~/.config/porkchop/config.json
+                  (default $PORKCHOP_PRESET). Flags and environment variables
+                  still win over it. See "porkchop -h" for the full description.
   -provider name  Inference backend: bedrock (default), anthropic, openai,
                   openai-compat.
   -model string   Model id (default $PORKCHOP_MODEL, then $MEAT_MODEL). For
@@ -134,7 +137,7 @@ func runProcess(args []string) {
 	// without deciding whether inference is needed. An empty diff has already
 	// returned above: a hook must not start failing on empty commits just
 	// because no backend is configured.
-	backendCfg, err := model.Resolve(backend.config())
+	backendCfg, err := backend.resolve()
 	if err != nil {
 		fatal("%v", err)
 	}
@@ -158,6 +161,14 @@ func runProcess(args []string) {
 	progress := func(string) {}
 	if !*quiet && isTerminal(os.Stderr) {
 		progress = func(msg string) { fmt.Fprintf(os.Stderr, "\r\x1b[Kporkchop: %s", msg) }
+	}
+
+	// Same egress line as the review command, under the same condition: a
+	// cache hit has already returned above, so reaching here means a diff is
+	// about to leave the machine. In a hook this lands in the log beside the
+	// outcome line, which is exactly where someone auditing later will look.
+	if !*quiet && isTerminal(os.Stderr) {
+		fmt.Fprintf(os.Stderr, "porkchop: using %s\n", describeBackend(backendCfg))
 	}
 
 	ctx := context.Background()

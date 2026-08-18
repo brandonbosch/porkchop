@@ -290,3 +290,111 @@ func TestPinFor(t *testing.T) {
 		t.Error("want an error for a base URL with no host")
 	}
 }
+
+// TestResolveWithDefaults_Precedence pins the whole layering in one place:
+// explicit flags beat the environment, which beats a stored preset, which beats
+// the built-in default. Getting this backwards is not a cosmetic bug — it is a
+// stored config file quietly overriding what a reviewer typed.
+func TestResolveWithDefaults_Precedence(t *testing.T) {
+	fallback := Config{
+		Provider: ProviderCompat,
+		Model:    "from-preset",
+		BaseURL:  "http://preset.invalid/v1",
+	}
+
+	t.Run("preset fills what nothing else supplies", func(t *testing.T) {
+		clearProviderEnv(t)
+		cfg, err := ResolveWithDefaults(Config{}, fallback)
+		if err != nil {
+			t.Fatalf("ResolveWithDefaults: %v", err)
+		}
+		if cfg.Provider != ProviderCompat || cfg.Model != "from-preset" || cfg.BaseURL != "http://preset.invalid/v1" {
+			t.Errorf("cfg = %+v, want the preset to apply", cfg)
+		}
+	})
+
+	t.Run("environment outranks the preset", func(t *testing.T) {
+		clearProviderEnv(t)
+		t.Setenv("PORKCHOP_MODEL", "from-env")
+		cfg, err := ResolveWithDefaults(Config{}, fallback)
+		if err != nil {
+			t.Fatalf("ResolveWithDefaults: %v", err)
+		}
+		if cfg.Model != "from-env" {
+			t.Errorf("model = %q, want the environment to win over the preset", cfg.Model)
+		}
+	})
+
+	t.Run("an explicit flag outranks both", func(t *testing.T) {
+		clearProviderEnv(t)
+		t.Setenv("PORKCHOP_MODEL", "from-env")
+		cfg, err := ResolveWithDefaults(Config{Model: "from-flag"}, fallback)
+		if err != nil {
+			t.Fatalf("ResolveWithDefaults: %v", err)
+		}
+		if cfg.Model != "from-flag" {
+			t.Errorf("model = %q, want the flag to win", cfg.Model)
+		}
+	})
+}
+
+// TestResolveWithDefaults_PresetCannotSkipValidation: a preset is data, not a
+// waiver. An openai-compat preset that forgets its endpoint has to fail exactly
+// as the bare flag does, rather than reaching Open with an empty base URL.
+func TestResolveWithDefaults_PresetCannotSkipValidation(t *testing.T) {
+	clearProviderEnv(t)
+	_, err := ResolveWithDefaults(Config{}, Config{Provider: ProviderCompat, Model: "m"})
+	if err == nil {
+		t.Fatal("want an error for an openai-compat preset with no base URL")
+	}
+	if !strings.Contains(err.Error(), "endpoint") {
+		t.Errorf("error = %v, want it to name the missing endpoint", err)
+	}
+}
+
+// TestResolveWithDefaults_PresetCannotSelectAnUnknownProvider: the config file
+// is user-editable, so a typo there must land on the same clear error a typo'd
+// -provider flag does.
+func TestResolveWithDefaults_PresetCannotSelectAnUnknownProvider(t *testing.T) {
+	clearProviderEnv(t)
+	_, err := ResolveWithDefaults(Config{}, Config{Provider: "ollama", Model: "m"})
+	if err == nil {
+		t.Fatal("want an error for a provider the switch does not know")
+	}
+	if !strings.Contains(err.Error(), "unknown provider") {
+		t.Errorf("error = %v", err)
+	}
+}
+
+// TestResolveWithDefaults_BedrockIgnoresPresetKeys: the presence of APIKey
+// selects fantasy's bearer-token branch, which is load-bearing for the
+// no-fallback guarantee. A stored config file does not get to reach into that
+// decision — the Bedrock token comes from $AWS_BEARER_TOKEN_BEDROCK or nowhere.
+func TestResolveWithDefaults_BedrockIgnoresPresetKeys(t *testing.T) {
+	clearProviderEnv(t)
+	cfg, err := ResolveWithDefaults(
+		Config{Provider: ProviderBedrock, Model: "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0", Region: "us-gov-west-1"},
+		Config{APIKey: "from-preset"},
+	)
+	if err != nil {
+		t.Fatalf("ResolveWithDefaults: %v", err)
+	}
+	if cfg.APIKey != "" {
+		t.Errorf("api key = %q, want a preset to be unable to supply a Bedrock token", cfg.APIKey)
+	}
+}
+
+// TestResolve_CompatKeyFromEnv covers the variable that had no documentation
+// until presets arrived: a local server that enforces a key (oMLX, vLLM) needs
+// this, and nothing in -h used to say so.
+func TestResolve_CompatKeyFromEnv(t *testing.T) {
+	clearProviderEnv(t)
+	t.Setenv("PORKCHOP_API_KEY", "sk-local")
+	cfg, err := Resolve(Config{Provider: ProviderCompat, Model: "m", BaseURL: "http://localhost:8888/v1"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if cfg.APIKey != "sk-local" {
+		t.Errorf("api key = %q, want it resolved from $PORKCHOP_API_KEY", cfg.APIKey)
+	}
+}

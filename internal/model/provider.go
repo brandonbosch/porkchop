@@ -63,14 +63,19 @@ type Config struct {
 	// $PORKCHOP_BEDROCK_REGION, $AWS_REGION, $AWS_DEFAULT_REGION, and then —
 	// on the SigV4 path only — the standard AWS configuration.
 	Region string
-	// APIKey is a Bedrock API key: a bearer token, not a SigV4 key pair. Empty
-	// resolves from $AWS_BEARER_TOKEN_BEDROCK, the variable the AWS tooling
-	// itself uses. There is deliberately no flag for it — a secret on a command
-	// line is visible to every process on the box.
+	// APIKey is the credential for whichever provider needs one, resolved
+	// per-provider from that provider's own variable: $AWS_BEARER_TOKEN_BEDROCK,
+	// $ANTHROPIC_API_KEY, $OPENAI_API_KEY, or $PORKCHOP_API_KEY for
+	// openai-compat. There is deliberately no flag for it — a secret on a
+	// command line is visible to every process on the box.
 	//
-	// When set it replaces the AWS credential chain entirely, which as a side
-	// effect makes the silent-egress hazard structurally impossible: fantasy
-	// takes a different branch that always installs the Bedrock option.
+	// For Bedrock it is a Bedrock API key: a bearer token, not a SigV4 key
+	// pair. When set it replaces the AWS credential chain entirely, which as a
+	// side effect makes the silent-egress hazard structurally impossible:
+	// fantasy takes a different branch that always installs the Bedrock option.
+	// The Bedrock resolution deliberately takes no preset fallback — the
+	// presence of this field selects that branch, and the no-fallback guarantee
+	// is not something a stored config file should be able to reach into.
 	APIKey string
 	// BaseURL overrides the endpoint. Required for openai-compat. For Bedrock
 	// it is optional and exists for FIPS and VPC endpoints, which the SDK's
@@ -84,15 +89,34 @@ type Config struct {
 // any inference is needed at all. Open calls it too, so callers key and compute
 // off the same resolution.
 func Resolve(cfg Config) (Config, error) {
-	cfg.Provider = cmp.Or(cfg.Provider, os.Getenv("PORKCHOP_PROVIDER"), DefaultProvider)
+	return ResolveWithDefaults(cfg, Config{})
+}
+
+// ResolveWithDefaults is Resolve with a weaker layer underneath the
+// environment: any field left empty by both cfg and the environment falls back
+// to fallback before the built-in default applies. The precedence is therefore
+//
+//	explicit (cfg) > environment > fallback > built-in default
+//
+// which is what lets cmd/porkchop offer stored presets without teaching that
+// package the environment variable names — they stay spelled out exactly once,
+// here. A preset sits *below* the environment deliberately: it is a stored
+// default a reviewer wrote once, and an exported variable in the shell they are
+// standing in is the more deliberate signal of the two.
+//
+// fallback is data, not policy. It cannot select a provider the switch below
+// does not know, and it cannot skip any validation — a preset naming
+// openai-compat with no base URL fails exactly as the flag would.
+func ResolveWithDefaults(cfg, fallback Config) (Config, error) {
+	cfg.Provider = cmp.Or(cfg.Provider, os.Getenv("PORKCHOP_PROVIDER"), fallback.Provider, DefaultProvider)
 	// PORKCHOP_MODEL is read before MEAT_MODEL so a machine that also runs
 	// plain meat can point porkchop at a Bedrock profile without disturbing the
 	// public model meat uses.
-	cfg.Model = cmp.Or(cfg.Model, os.Getenv("PORKCHOP_MODEL"), os.Getenv("MEAT_MODEL"))
+	cfg.Model = cmp.Or(cfg.Model, os.Getenv("PORKCHOP_MODEL"), os.Getenv("MEAT_MODEL"), fallback.Model)
 
 	switch cfg.Provider {
 	case ProviderBedrock:
-		cfg.Region = cmp.Or(cfg.Region, os.Getenv("PORKCHOP_BEDROCK_REGION"), os.Getenv("AWS_REGION"), os.Getenv("AWS_DEFAULT_REGION"))
+		cfg.Region = cmp.Or(cfg.Region, os.Getenv("PORKCHOP_BEDROCK_REGION"), os.Getenv("AWS_REGION"), os.Getenv("AWS_DEFAULT_REGION"), fallback.Region)
 		cfg.APIKey = cmp.Or(cfg.APIKey, os.Getenv("AWS_BEARER_TOKEN_BEDROCK"))
 		if cfg.Model == "" {
 			return Config{}, fmt.Errorf("porkchop: bedrock needs a Bedrock inference profile id — an AWS resource naming a model, not the ~/.aws named profile $AWS_PROFILE selects: pass -model or set $PORKCHOP_MODEL (commercial: us.anthropic.claude-sonnet-4-5-20250929-v1:0; GovCloud: us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0); list them with `aws bedrock list-inference-profiles --region <region>`")
@@ -106,16 +130,25 @@ func Resolve(cfg Config) (Config, error) {
 		}
 	case ProviderAnthropic:
 		cfg.Model = cmp.Or(cfg.Model, meat.DefaultAnthropicModel)
+		cfg.BaseURL = cmp.Or(cfg.BaseURL, fallback.BaseURL)
+		cfg.APIKey = cmp.Or(cfg.APIKey, os.Getenv("ANTHROPIC_API_KEY"), fallback.APIKey)
 	case ProviderOpenAI:
 		cfg.Model = cmp.Or(cfg.Model, meat.DefaultOpenAIModel)
+		cfg.BaseURL = cmp.Or(cfg.BaseURL, fallback.BaseURL)
+		cfg.APIKey = cmp.Or(cfg.APIKey, os.Getenv("OPENAI_API_KEY"), fallback.APIKey)
 	case ProviderCompat:
 		if cfg.Model == "" {
 			return Config{}, fmt.Errorf("porkchop: %s needs a model id: pass -model or set $PORKCHOP_MODEL", ProviderCompat)
 		}
-		cfg.BaseURL = cmp.Or(cfg.BaseURL, os.Getenv("PORKCHOP_BASE_URL"))
+		cfg.BaseURL = cmp.Or(cfg.BaseURL, os.Getenv("PORKCHOP_BASE_URL"), fallback.BaseURL)
 		if cfg.BaseURL == "" {
 			return Config{}, fmt.Errorf("porkchop: %s needs an endpoint: pass -base-url or set $PORKCHOP_BASE_URL", ProviderCompat)
 		}
+		// Resolved here rather than read at Open time so that every credential
+		// a run will use is decided in one offline place. Local servers vary:
+		// llama.cpp ignores the key, Ollama ignores it, oMLX and vLLM enforce
+		// one. Empty stays empty and Open substitutes a placeholder.
+		cfg.APIKey = cmp.Or(cfg.APIKey, os.Getenv("PORKCHOP_API_KEY"), fallback.APIKey)
 	default:
 		return Config{}, fmt.Errorf("porkchop: unknown provider %q (want one of %s, %s, %s, %s)",
 			cfg.Provider, ProviderBedrock, ProviderAnthropic, ProviderOpenAI, ProviderCompat)
@@ -136,31 +169,29 @@ func Open(ctx context.Context, cfg Config) (meat.Model, error) {
 	case ProviderBedrock:
 		provider, err = openBedrock(ctx, cfg)
 	case ProviderAnthropic:
-		key := os.Getenv("ANTHROPIC_API_KEY")
-		if key == "" {
+		if cfg.APIKey == "" {
 			return nil, fmt.Errorf("porkchop: %s needs $ANTHROPIC_API_KEY", ProviderAnthropic)
 		}
-		opts := []anthropic.Option{anthropic.WithAPIKey(key)}
+		opts := []anthropic.Option{anthropic.WithAPIKey(cfg.APIKey)}
 		if cfg.BaseURL != "" {
 			opts = append(opts, anthropic.WithBaseURL(cfg.BaseURL))
 		}
 		provider, err = anthropic.New(opts...)
 	case ProviderOpenAI:
-		key := os.Getenv("OPENAI_API_KEY")
-		if key == "" {
+		if cfg.APIKey == "" {
 			return nil, fmt.Errorf("porkchop: %s needs $OPENAI_API_KEY", ProviderOpenAI)
 		}
-		opts := []openai.Option{openai.WithAPIKey(key)}
+		opts := []openai.Option{openai.WithAPIKey(cfg.APIKey)}
 		if cfg.BaseURL != "" {
 			opts = append(opts, openai.WithBaseURL(cfg.BaseURL))
 		}
 		provider, err = openai.New(opts...)
 	case ProviderCompat:
-		// A local server usually wants no key at all; send a placeholder so the
+		// Some local servers want no key at all; send a placeholder so the
 		// client does not refuse to build.
 		provider, err = openaicompat.New(
 			openaicompat.WithBaseURL(cfg.BaseURL),
-			openaicompat.WithAPIKey(cmp.Or(os.Getenv("PORKCHOP_API_KEY"), "none")),
+			openaicompat.WithAPIKey(cmp.Or(cfg.APIKey, "none")),
 		)
 	}
 	if err != nil {
