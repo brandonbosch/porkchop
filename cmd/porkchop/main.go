@@ -58,8 +58,10 @@ Commands:
   porkchop hook uninstall        Remove it.
   porkchop hook status           Report whether it is installed.
 
-  Run a command with -h for its own flags. A revision literally named "process"
-  or "hook" can still be reviewed as "porkchop -- process".
+  Run a command with -h for its own flags. Only "process" and "hook" are reserved;
+  a branch literally named either can still be reviewed as "porkchop -- process".
+  Note the verbs belong to their command: it is "porkchop hook status", not
+  "porkchop status".
 
 porkchop reads a unified diff, asks meat's core to abridge it into a reading
 diff, and presents it in a TUI. On a terminal it opens the review screen; when
@@ -105,11 +107,45 @@ func main() {
 		case "hook":
 			runHook(args[1:])
 			return
+		case "help":
+			fmt.Fprint(os.Stdout, usage)
+			return
 		case "--":
 			args = args[1:]
 		}
 	}
 	runReview(args)
+}
+
+// fatalReadDiff reports a failure to read the diff, adding a hint when the argument
+// that failed is one of porkchop's own subcommand verbs.
+//
+// `porkchop status` is a natural thing to type and is not a subcommand — only
+// `porkchop hook status` is — so it is read as a revision, and git answers with a
+// wall of "ambiguous argument" text that says nothing about what the reviewer
+// actually wanted. Reserving the verb instead would shadow anyone's branch of that
+// name; hinting costs nothing and shadows nothing.
+//
+// The hint is only ever reached because the lookup failed, which means the word is
+// not a revision in this repo — so it is safe even after an explicit `--`.
+func fatalReadDiff(args []string, err error) {
+	if hint := subcommandHint(args); hint != "" {
+		fatal("%v\nporkchop: %s", err, hint)
+	}
+	fatal("%v", err)
+}
+
+// subcommandHint names the command a verb belongs to, or "" if it is not one.
+func subcommandHint(args []string) string {
+	if len(args) != 1 {
+		return ""
+	}
+	verb := args[0]
+	switch verb {
+	case "install", "uninstall", "status":
+		return fmt.Sprintf("%q is not a revision — did you mean `porkchop hook %s`?", verb, verb)
+	}
+	return ""
 }
 
 // parseFlexible parses fs over args, accepting flags before or after the positional
@@ -194,7 +230,7 @@ func runReview(args []string) {
 func computeResult(args []string, staged, worktree bool, model string, noCache, jsonOut bool) (string, *meat.Result) {
 	diff, source, err := gitx.ReadDiff(args, staged, worktree)
 	if err != nil {
-		fatal("%v", err)
+		fatalReadDiff(args, err)
 	}
 	if strings.TrimSpace(diff) == "" {
 		fatal("no diff to read (%s)", source)

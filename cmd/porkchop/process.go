@@ -104,7 +104,7 @@ func runProcess(args []string) {
 
 	diff, source, err := gitx.ReadDiff(revs, *staged, *worktree)
 	if err != nil {
-		fatal("%v", err)
+		fatalReadDiff(revs, err)
 	}
 	report := processReport{Source: source}
 	if len(revs) == 1 {

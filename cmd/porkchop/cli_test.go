@@ -560,3 +560,65 @@ func TestOpenViewed(t *testing.T) {
 		t.Errorf("openViewed with caching disabled = %v, want nil", got)
 	}
 }
+
+// TestSubcommandVerbHint covers the diagnostic for a real thing people type. The
+// verbs belong to their command — it is `porkchop hook status`, not `porkchop
+// status` — so a bare verb is read as a revision and git answers with a wall of
+// "ambiguous argument" text that says nothing about what was actually wanted.
+// Reserving the verbs would shadow branches of those names; hinting shadows nothing.
+func TestSubcommandVerbHint(t *testing.T) {
+	repo, cache := newRepo(t), t.TempDir()
+
+	for _, verb := range []string{"status", "install", "uninstall"} {
+		got := runIn(t, repo, cache, verb)
+		if got.code == 0 {
+			t.Errorf("porkchop %s succeeded as a revision: %s", verb, got.all())
+			continue
+		}
+		want := fmt.Sprintf("porkchop hook %s", verb)
+		if !strings.Contains(got.stderr, want) {
+			t.Errorf("porkchop %s does not suggest %q:\n%s", verb, want, got.stderr)
+		}
+		if !strings.Contains(got.stderr, "not a revision") {
+			t.Errorf("porkchop %s does not explain why it failed:\n%s", verb, got.stderr)
+		}
+	}
+
+	// The same hint reaches the process command, which takes a revision too.
+	if got := runIn(t, repo, cache, "process", "status"); !strings.Contains(got.stderr, "porkchop hook status") {
+		t.Errorf("process does not hint on a subcommand verb:\n%s", got.stderr)
+	}
+
+	// A revision that is simply wrong gets no hint — an unconditional suggestion
+	// would be noise on every typo.
+	got := runIn(t, repo, cache, "no-such-rev")
+	if got.code == 0 {
+		t.Fatal("a nonexistent revision succeeded")
+	}
+	if strings.Contains(got.stderr, "did you mean") {
+		t.Errorf("hinted on an ordinary bad revision:\n%s", got.stderr)
+	}
+
+	// A branch really named "status" resolves, and is reviewed rather than hinted at.
+	runGit(t, repo, "branch", "status")
+	seedCache(t, repo, cache, []string{"status"})
+	if got := runIn(t, repo, cache, "-plain", "status"); got.code != 0 {
+		t.Errorf("a branch named status could not be reviewed: %s", got.all())
+	}
+}
+
+// TestHelpVerb checks `porkchop help` works, since it is what someone types before
+// they know that -h is the flag. It goes to stdout so it can be piped to a pager.
+func TestHelpVerb(t *testing.T) {
+	repo, cache := newRepo(t), t.TempDir()
+	got := runIn(t, repo, cache, "help")
+	if got.code != 0 {
+		t.Fatalf("porkchop help exited %d: %s", got.code, got.all())
+	}
+	if !strings.Contains(got.stdout, "Commands:") {
+		t.Errorf("help does not list the commands:\n%s", got.stdout)
+	}
+	if got.stderr != "" {
+		t.Errorf("help wrote to stderr: %q", got.stderr)
+	}
+}
