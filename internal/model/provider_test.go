@@ -14,6 +14,10 @@ func clearProviderEnv(t *testing.T) {
 	for _, k := range []string{
 		"PORKCHOP_PROVIDER", "PORKCHOP_MODEL", "PORKCHOP_BEDROCK_REGION", "PORKCHOP_BASE_URL", "PORKCHOP_API_KEY",
 		"MEAT_MODEL", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY",
+		// Not cosmetic: a Bedrock API key left in the environment would send
+		// the no-fallback tests down the bearer branch, where they would pass
+		// without testing anything.
+		"AWS_BEARER_TOKEN_BEDROCK",
 	} {
 		t.Setenv(k, "")
 	}
@@ -224,5 +228,65 @@ func TestOpen_CompatBuildsAModel(t *testing.T) {
 	}
 	if m == nil {
 		t.Fatal("model is nil")
+	}
+}
+
+// TestResolve_BedrockAPIKeyNeedsARegion guards a trap in fantasy that is quiet
+// and expensive: bedrockBasicAuthConfig defaults a missing region to commercial
+// "us-east-1". A GovCloud key with no region set would therefore aim a CUI
+// request at the wrong partition while looking perfectly configured.
+func TestResolve_BedrockAPIKeyNeedsARegion(t *testing.T) {
+	clearProviderEnv(t)
+	isolateAWS(t)
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	t.Setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-api-key")
+
+	_, err := Resolve(Config{Provider: ProviderBedrock, Model: "m"})
+	if err == nil {
+		t.Fatal("want an error: a Bedrock API key carries no region")
+	}
+	if !strings.Contains(err.Error(), "region") {
+		t.Errorf("error = %v, want it to ask for a region", err)
+	}
+}
+
+// TestOpen_BedrockAPIKeyBypassesTheCredentialChain: a bearer token replaces the
+// AWS credential chain outright, so this must succeed in an environment with no
+// SigV4 credentials whatsoever — the environment the no-fallback tests use to
+// prove failure.
+func TestOpen_BedrockAPIKeyBypassesTheCredentialChain(t *testing.T) {
+	clearProviderEnv(t)
+	isolateAWS(t)
+	t.Setenv("AWS_BEARER_TOKEN_BEDROCK", "bedrock-api-key")
+
+	m, err := Open(context.Background(), Config{
+		Provider: ProviderBedrock,
+		Model:    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+		Region:   "us-gov-west-1",
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if m == nil {
+		t.Fatal("model is nil")
+	}
+}
+
+func TestPinFor(t *testing.T) {
+	// GovCloud falls out of the same hostname shape the SDK builds.
+	if got, err := pinFor(Config{}, "us-gov-west-1"); err != nil || got != "bedrock-runtime.us-gov-west-1.amazonaws.com" {
+		t.Errorf("pinFor = %q, %v", got, err)
+	}
+	// A FIPS or VPC endpoint the SDK's hardcoded hostname cannot express.
+	if got, err := pinFor(Config{BaseURL: "https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com"}, "us-gov-west-1"); err != nil || got != "bedrock-runtime-fips.us-gov-west-1.amazonaws.com" {
+		t.Errorf("pinFor with a base URL = %q, %v", got, err)
+	}
+	// Plaintext would carry CUI in the clear; refuse before anything is built.
+	if _, err := pinFor(Config{BaseURL: "http://bedrock-runtime.us-gov-west-1.amazonaws.com"}, "us-gov-west-1"); err == nil {
+		t.Error("want an error for a plaintext base URL")
+	}
+	if _, err := pinFor(Config{BaseURL: "not a url"}, "us-gov-west-1"); err == nil {
+		t.Error("want an error for a base URL with no host")
 	}
 }

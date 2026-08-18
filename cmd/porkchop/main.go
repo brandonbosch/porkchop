@@ -82,9 +82,12 @@ Flags:
   -model string   Model id (default $PORKCHOP_MODEL, then $MEAT_MODEL). Bedrock
                   needs a full inference profile id and has no default, because
                   the id is passed through verbatim and forms the cache key.
-  -region string  AWS region for bedrock (default $PORKCHOP_BEDROCK_REGION or
-                  your AWS config).
-  -base-url url   Endpoint override; required for openai-compat.
+  -region string  AWS region for bedrock (default $PORKCHOP_BEDROCK_REGION,
+                  $AWS_REGION, or your AWS config). Required when authenticating
+                  with a Bedrock API key, which carries no region of its own.
+  -base-url url   Endpoint override; required for openai-compat, and the way to
+                  reach a Bedrock FIPS or VPC endpoint. The transport pin
+                  follows it.
   -no-cache       Ignore any cached result and recompute (still updates cache).
   -staged         Review the staged changes (git diff --staged).
   -w              Review the unstaged working-tree changes (git diff).
@@ -105,6 +108,10 @@ Environment:
   PORKCHOP_BASE_URL                    Default endpoint for openai-compat.
   AWS_PROFILE / AWS_REGION / ~/.aws    Bedrock credentials, via the standard AWS
                                        chain (SSO, assume-role, env, IMDS).
+  AWS_BEARER_TOKEN_BEDROCK             A Bedrock API key, used instead of the
+                                       credential chain. Env only — there is no
+                                       flag, because a secret on a command line
+                                       is visible to every process on the box.
   ANTHROPIC_API_KEY / OPENAI_API_KEY   API key, for those providers only.
   MEAT_MODEL                           Fallback default model id.
   MEAT_CACHE                           Optional cache dir (default ~/.meat; empty disables).

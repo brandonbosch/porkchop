@@ -38,8 +38,10 @@ Flags:
                   openai-compat.
   -model string   Model id (default $PORKCHOP_MODEL, then $MEAT_MODEL). Bedrock
                   needs a full inference profile id and has no default.
-  -region string  AWS region for bedrock.
-  -base-url url   Endpoint override; required for openai-compat.
+  -region string  AWS region for bedrock; required with a Bedrock API key
+                  ($AWS_BEARER_TOKEN_BEDROCK), which carries no region.
+  -base-url url   Endpoint override; required for openai-compat, and the way to
+                  reach a Bedrock FIPS or VPC endpoint.
   -no-cache       Recompute even if a cached result exists (still updates cache).
   -staged         Process the staged changes (git diff --staged).
   -w              Process the unstaged working-tree changes (git diff).

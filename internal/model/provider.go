@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -57,10 +58,21 @@ type Config struct {
 	// provider's default — Bedrock and openai-compat have none.
 	Model string
 	// Region is the AWS region for Bedrock. Empty resolves from
-	// $PORKCHOP_BEDROCK_REGION, then the standard AWS configuration.
+	// $PORKCHOP_BEDROCK_REGION, $AWS_REGION, $AWS_DEFAULT_REGION, and then —
+	// on the SigV4 path only — the standard AWS configuration.
 	Region string
-	// BaseURL overrides the endpoint. Required for openai-compat, ignored for
-	// Bedrock, whose endpoint is derived from the region and pinned.
+	// APIKey is a Bedrock API key: a bearer token, not a SigV4 key pair. Empty
+	// resolves from $AWS_BEARER_TOKEN_BEDROCK, the variable the AWS tooling
+	// itself uses. There is deliberately no flag for it — a secret on a command
+	// line is visible to every process on the box.
+	//
+	// When set it replaces the AWS credential chain entirely, which as a side
+	// effect makes the silent-egress hazard structurally impossible: fantasy
+	// takes a different branch that always installs the Bedrock option.
+	APIKey string
+	// BaseURL overrides the endpoint. Required for openai-compat. For Bedrock
+	// it is optional and exists for FIPS and VPC endpoints, which the SDK's
+	// hardcoded hostname cannot express; the transport pin follows it.
 	BaseURL string
 }
 
@@ -78,9 +90,17 @@ func Resolve(cfg Config) (Config, error) {
 
 	switch cfg.Provider {
 	case ProviderBedrock:
-		cfg.Region = cmp.Or(cfg.Region, os.Getenv("PORKCHOP_BEDROCK_REGION"))
+		cfg.Region = cmp.Or(cfg.Region, os.Getenv("PORKCHOP_BEDROCK_REGION"), os.Getenv("AWS_REGION"), os.Getenv("AWS_DEFAULT_REGION"))
+		cfg.APIKey = cmp.Or(cfg.APIKey, os.Getenv("AWS_BEARER_TOKEN_BEDROCK"))
 		if cfg.Model == "" {
 			return Config{}, fmt.Errorf("porkchop: bedrock needs an inference profile id: pass -model (e.g. -model us.anthropic.claude-sonnet-4-5-20250929-v1:0) or set $PORKCHOP_MODEL")
+		}
+		// A Bedrock API key carries no region, and fantasy defaults a missing
+		// one to commercial us-east-1. In GovCloud — or any partition that is
+		// not the default — that would aim a CUI request at the wrong cloud
+		// while looking configured. Demand the region here instead.
+		if cfg.APIKey != "" && cfg.Region == "" {
+			return Config{}, fmt.Errorf("porkchop: bedrock: a Bedrock API key carries no region, and guessing one would target the wrong partition: pass -region (e.g. -region us-gov-west-1) or set $PORKCHOP_BEDROCK_REGION")
 		}
 	case ProviderAnthropic:
 		cfg.Model = cmp.Or(cfg.Model, meat.DefaultAnthropicModel)
@@ -152,8 +172,8 @@ func Open(ctx context.Context, cfg Config) (meat.Model, error) {
 	return New(lm), nil
 }
 
-// openBedrock builds the Bedrock provider, but only after proving the
-// credentials exist.
+// openBedrock builds the Bedrock provider, but only after proving there is
+// something to authenticate with.
 //
 // This is the whole reason internal/model resolves credentials itself. In
 // fantasy v0.41.1 the Bedrock credential path is
@@ -178,7 +198,13 @@ func Open(ctx context.Context, cfg Config) (meat.Model, error) {
 //     else cannot leave. It fails loudly and names the host it refused, so an
 //     upstream change to the endpoint shows up as an error rather than as
 //     egress.
+//
+// A Bedrock API key takes a different branch, described at withAPIKey.
 func openBedrock(ctx context.Context, cfg Config) (fantasy.Provider, error) {
+	if cfg.APIKey != "" {
+		return withAPIKey(cfg)
+	}
+
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("porkchop: bedrock: cannot load AWS configuration: %w", err)
@@ -198,20 +224,81 @@ func openBedrock(ctx context.Context, cfg Config) (fantasy.Provider, error) {
 		return nil, fmt.Errorf("porkchop: bedrock: AWS credentials from %q are empty", creds.Source)
 	}
 
-	return bedrock.New(
-		bedrock.WithRegion(region),
-		bedrock.WithHTTPClient(&http.Client{
-			Timeout:   2 * time.Minute,
-			Transport: &pinnedHost{host: bedrockHost(region), rt: http.DefaultTransport},
-		}),
-	)
+	pin, err := pinFor(cfg, region)
+	if err != nil {
+		return nil, err
+	}
+	opts := []bedrock.Option{bedrock.WithRegion(region), bedrock.WithHTTPClient(pinnedClient(pin))}
+	if cfg.BaseURL != "" {
+		opts = append(opts, bedrock.WithBaseURL(cfg.BaseURL))
+	}
+	return bedrock.New(opts...)
+}
+
+// withAPIKey builds the Bedrock provider from a Bedrock API key — a bearer
+// token, presented as an Authorization header rather than a SigV4 signature.
+//
+// There is nothing to validate ahead of time: a bearer token has no local
+// retrieve step that could fail, so its first real test is the first request.
+// That is fine here, because this branch is the *safe* one. fantasy routes a
+// non-empty API key through bedrockBasicAuthConfig, which builds the aws.Config
+// itself and therefore always installs the Bedrock option — the swallowed-error
+// fallback documented above cannot be reached from this path at all.
+//
+// The one hazard this branch has of its own is the region, and it is a bad one:
+// bedrockBasicAuthConfig defaults a missing region to commercial "us-east-1",
+// so a GovCloud key with no region set would aim at the wrong partition while
+// looking perfectly configured. Resolve refuses that combination before we get
+// here, and the transport pin refuses it again on the way out.
+func withAPIKey(cfg Config) (fantasy.Provider, error) {
+	if cfg.Region == "" {
+		return nil, fmt.Errorf("porkchop: bedrock: a Bedrock API key needs an explicit region")
+	}
+	pin, err := pinFor(cfg, cfg.Region)
+	if err != nil {
+		return nil, err
+	}
+	opts := []bedrock.Option{
+		bedrock.WithRegion(cfg.Region),
+		bedrock.WithAPIKey(cfg.APIKey),
+		bedrock.WithHTTPClient(pinnedClient(pin)),
+	}
+	if cfg.BaseURL != "" {
+		opts = append(opts, bedrock.WithBaseURL(cfg.BaseURL))
+	}
+	return bedrock.New(opts...)
+}
+
+// pinFor is the host the transport will allow: the endpoint an explicit
+// BaseURL names, or the one anthropic-sdk-go's bedrock.WithConfig derives from
+// the region. Deriving it the same way is what lets pinnedHost tell an intended
+// request from a fallback.
+func pinFor(cfg Config, region string) (string, error) {
+	if cfg.BaseURL == "" {
+		return bedrockHost(region), nil
+	}
+	u, err := url.Parse(cfg.BaseURL)
+	if err != nil {
+		return "", fmt.Errorf("porkchop: bedrock: cannot parse -base-url %q: %w", cfg.BaseURL, err)
+	}
+	if u.Scheme != "https" || u.Hostname() == "" {
+		return "", fmt.Errorf("porkchop: bedrock: -base-url must be an https URL with a host, got %q", cfg.BaseURL)
+	}
+	return u.Hostname(), nil
 }
 
 // bedrockHost is the endpoint anthropic-sdk-go's bedrock.WithConfig sets for a
-// region. Deriving it the same way is what lets pinnedHost tell an intended
-// request from a fallback.
+// region. GovCloud falls out of the same shape (bedrock-runtime.us-gov-west-1
+// .amazonaws.com); a FIPS or VPC endpoint does not, and needs -base-url.
 func bedrockHost(region string) string {
 	return "bedrock-runtime." + region + ".amazonaws.com"
+}
+
+func pinnedClient(host string) *http.Client {
+	return &http.Client{
+		Timeout:   2 * time.Minute,
+		Transport: &pinnedHost{host: host, rt: http.DefaultTransport},
+	}
 }
 
 // pinnedHost is a RoundTripper that refuses to send anywhere but one host over

@@ -89,7 +89,11 @@ func strippedEnv() []string {
 	var env []string
 	for _, kv := range os.Environ() {
 		switch key := strings.SplitN(kv, "=", 2)[0]; key {
-		case "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "MEAT_CACHE", "MEAT_MODEL":
+		case "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "MEAT_CACHE", "MEAT_MODEL",
+			// A Bedrock API key left in the environment would send the
+			// no-fallback test down the bearer branch, where it would pass
+			// without testing anything.
+			"AWS_BEARER_TOKEN_BEDROCK":
 			continue
 		default:
 			// A developer's own PORKCHOP_* settings would otherwise choose a
