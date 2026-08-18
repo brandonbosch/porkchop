@@ -447,3 +447,152 @@ func TestMarkerColorMatchesItsWording(t *testing.T) {
 		})
 	}
 }
+
+// TestElisionSteppingFollowsTheView is a defect found in live use, not by
+// design review.
+//
+// n/p walked a private index that only n/p ever moved, so every other way of
+// getting somewhere — tab, ]/[, }/{, plain scrolling — left it behind. The
+// reviewer's account: tab to the file they wanted, press n for the next
+// elision, and get yanked back to wherever they last pressed n, then have to
+// walk forward again a keystroke at a time. The view resetting under them is
+// the whole complaint; "next" has to mean next from *here*.
+func TestElisionSteppingFollowsTheView(t *testing.T) {
+	in := goldenInputs(t)["django-526b1b414d8e.golden.diff"]
+	m := viewedModel(t, in, newFakeViewed(), 200)
+	if len(m.marks) < 4 {
+		t.Skipf("golden has %d markers, need 4", len(m.marks))
+	}
+
+	// The reviewer is early in the change, on the first elision.
+	m.cur = 0
+	m.scrollToMark(0)
+
+	// They jump somewhere else entirely — the file holding the last elision.
+	last := len(m.marks) - 1
+	target := fileHoldingLine(m, m.markerLine[last])
+	if target < 0 {
+		t.Fatal("could not find the file holding the last marker")
+	}
+	m.jumpToRow(m.fileRows[target])
+	top := m.vp.YOffset()
+
+	// n must mean "the next elision from where I am looking".
+	m = press(m, 'n')
+	if m.cur == 1 {
+		t.Fatal("n resumed the old walk instead of stepping from the view")
+	}
+	if got := m.markerLine[m.cur]; got < top {
+		t.Errorf("n landed on marker %d at line %d, above the viewport top %d: the view was reset backwards", m.cur, got, top)
+	}
+}
+
+// TestElisionSteppingBackwardsFollowsTheView is the same defect in the other
+// direction: p from a fresh position must find the elision before it.
+func TestElisionSteppingBackwardsFollowsTheView(t *testing.T) {
+	in := goldenInputs(t)["django-526b1b414d8e.golden.diff"]
+	m := viewedModel(t, in, newFakeViewed(), 200)
+	if len(m.marks) < 4 {
+		t.Skipf("golden has %d markers, need 4", len(m.marks))
+	}
+
+	m.cur = 0
+	m.scrollToMark(0)
+
+	last := len(m.marks) - 1
+	target := fileHoldingLine(m, m.markerLine[last])
+	if target < 0 {
+		t.Fatal("could not find the file holding the last marker")
+	}
+	m.jumpToRow(m.fileRows[target])
+	top := m.vp.YOffset()
+
+	// The precise answer: the last marker above the top of the screen. Asserting
+	// only "somewhere above" would pass on the old behavior, which clamped to 0.
+	want := -1
+	for i, line := range m.markerLine {
+		if line < top {
+			want = i
+		}
+	}
+	if want <= 0 {
+		t.Skip("golden puts no marker above the jump target but the first")
+	}
+
+	m = press(m, 'p')
+	if m.cur != want {
+		t.Errorf("p landed on marker %d (line %d), want %d (line %d), from a viewport top of %d",
+			m.cur, m.markerLine[m.cur], want, m.markerLine[want], top)
+	}
+}
+
+// TestElisionSteppingStillWalks is the reason the cursor is not simply derived
+// from the viewport every time. scrollToMark seats a marker a third of the way
+// down the screen, so the line above it stays visible — a purely view-derived
+// "first marker at or below the top" would keep finding the marker it just
+// landed on, and n would stick. Repeated n must still advance one at a time.
+func TestElisionSteppingStillWalks(t *testing.T) {
+	in := goldenInputs(t)["django-526b1b414d8e.golden.diff"]
+	m := viewedModel(t, in, newFakeViewed(), 200)
+	if len(m.marks) < 4 {
+		t.Skipf("golden has %d markers, need 4", len(m.marks))
+	}
+
+	m.cur = 0
+	m.scrollToMark(0)
+	for want := 1; want <= 3; want++ {
+		m = press(m, 'n')
+		if m.cur != want {
+			t.Fatalf("n number %d landed on marker %d, want %d", want, m.cur, want)
+		}
+	}
+	for want := 2; want >= 0; want-- {
+		m = press(m, 'p')
+		if m.cur != want {
+			t.Fatalf("p landed on marker %d, want %d", m.cur, want)
+		}
+	}
+}
+
+// TestExpandFollowsTheView covers the sibling of the same defect: e expanded
+// whatever marker the stale cursor pointed at, so after tabbing away it changed
+// content off screen — a worse failure than n's, because nothing visible moves
+// to explain it.
+func TestExpandFollowsTheView(t *testing.T) {
+	in := goldenInputs(t)["django-526b1b414d8e.golden.diff"]
+	m := viewedModel(t, in, newFakeViewed(), 200)
+	if len(m.marks) < 4 {
+		t.Skipf("golden has %d markers, need 4", len(m.marks))
+	}
+
+	m.cur = 0
+	m.scrollToMark(0)
+
+	last := len(m.marks) - 1
+	target := fileHoldingLine(m, m.markerLine[last])
+	if target < 0 {
+		t.Fatal("could not find the file holding the last marker")
+	}
+	m.jumpToRow(m.fileRows[target])
+
+	m = press(m, 'e')
+	if m.expanded[0] {
+		t.Error("e expanded the first marker, which is off screen and nowhere near the reviewer")
+	}
+	if !m.expanded[m.cur] {
+		t.Errorf("e did not expand the marker it seated on (%d)", m.cur)
+	}
+}
+
+// fileHoldingLine reports which file a body line belongs to, walking back to the
+// nearest line that shows a row — a rendered line need not carry one.
+func fileHoldingLine(m Model, line int) int {
+	for i := line; i >= 0 && i < len(m.body); i-- {
+		row := m.body[i].firstRow()
+		if row < 0 || row >= len(m.rowFile) {
+			continue
+		}
+		return m.rowFile[row]
+	}
+	return -1
+}

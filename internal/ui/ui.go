@@ -1275,7 +1275,10 @@ func (m *Model) stepMark(delta int) {
 	if len(m.marks) == 0 || m.audit {
 		return
 	}
-	next := m.cur + delta
+	next, ok := m.markFromView(delta)
+	if !ok {
+		next = m.cur + delta
+	}
 	switch {
 	case next < 0:
 		next = 0
@@ -1290,7 +1293,16 @@ func (m *Model) stepMark(delta int) {
 }
 
 func (m *Model) toggleCurrent() {
-	if m.cur < 0 || m.cur >= len(m.marks) || m.audit {
+	if len(m.marks) == 0 || m.audit {
+		return
+	}
+	// e acts on the marker the reviewer is looking at. Without this it acted on
+	// wherever n last was, expanding content off screen — a worse version of
+	// the same defect, because nothing visible moves to explain it.
+	if seated, ok := m.markFromView(1); ok {
+		m.cur = seated
+	}
+	if m.cur < 0 || m.cur >= len(m.marks) {
 		return
 	}
 	m.expanded[m.cur] = !m.expanded[m.cur]
@@ -1320,6 +1332,47 @@ func (m *Model) toggleAll() {
 	if m.cur >= 0 {
 		m.scrollToMark(m.cur)
 	}
+}
+
+// markFromView re-seats the elision cursor from the viewport, and reports
+// whether it had to.
+//
+// n/p keep a cursor because they need one: scrollToMark seats a marker a third
+// of the way down the screen, so the marker just landed on stays visible, and a
+// rule of "the first marker at or below the top" would keep finding it and n
+// would stick. But that cursor was *only* ever moved by n/p, so every other way
+// of getting somewhere — tab, ]/[, }/{, plain scrolling — left it behind, and
+// the next n yanked the reviewer back to wherever they last pressed it.
+//
+// So: walk from the cursor while the reviewer is still looking at it, and
+// otherwise seat it where they actually are. Forward means the first marker at
+// or below the top of the screen, backward the last one above it — the same
+// "from where I am" rule stepAnchor already uses for files and hunks, which is
+// what made n the odd key out.
+func (m Model) markFromView(delta int) (int, bool) {
+	if !m.ready || len(m.markerLine) == 0 {
+		return 0, false
+	}
+	top := m.vp.YOffset()
+	if cur := m.cur; cur >= 0 && cur < len(m.markerLine) {
+		if line := m.markerLine[cur]; line >= top && line < top+m.vp.Height() {
+			return 0, false // still on screen: keep walking
+		}
+	}
+	if delta > 0 {
+		for i, line := range m.markerLine {
+			if line >= top {
+				return i, true
+			}
+		}
+		return len(m.markerLine) - 1, true
+	}
+	for i := len(m.markerLine) - 1; i >= 0; i-- {
+		if m.markerLine[i] < top {
+			return i, true
+		}
+	}
+	return 0, true
 }
 
 // scrollToMark brings a marker into view, seating it a third of the way down so
