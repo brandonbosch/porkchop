@@ -52,8 +52,10 @@ type Config struct {
 	// $PORKCHOP_PROVIDER, then DefaultProvider.
 	Provider string
 	// Model is the provider's model id. For Bedrock it must be a complete
-	// inference profile id, e.g. "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
-	// fantasy v0.41.1 passes the id through verbatim and adds no region prefix.
+	// inference profile id — "us.anthropic.claude-sonnet-4-5-20250929-v1:0" in
+	// the commercial partition, "us-gov.anthropic.…" in GovCloud. fantasy
+	// v0.41.1 passes the id through verbatim and adds no prefix of its own, so
+	// a commercial id in GovCloud fails rather than being corrected.
 	// Empty resolves from $PORKCHOP_MODEL, then $MEAT_MODEL, then the
 	// provider's default — Bedrock and openai-compat have none.
 	Model string
@@ -93,7 +95,7 @@ func Resolve(cfg Config) (Config, error) {
 		cfg.Region = cmp.Or(cfg.Region, os.Getenv("PORKCHOP_BEDROCK_REGION"), os.Getenv("AWS_REGION"), os.Getenv("AWS_DEFAULT_REGION"))
 		cfg.APIKey = cmp.Or(cfg.APIKey, os.Getenv("AWS_BEARER_TOKEN_BEDROCK"))
 		if cfg.Model == "" {
-			return Config{}, fmt.Errorf("porkchop: bedrock needs a Bedrock inference profile id — an AWS resource naming a model, not the ~/.aws named profile $AWS_PROFILE selects: pass -model (e.g. -model us.anthropic.claude-sonnet-4-5-20250929-v1:0) or set $PORKCHOP_MODEL; list them with `aws bedrock list-inference-profiles --region <region>`")
+			return Config{}, fmt.Errorf("porkchop: bedrock needs a Bedrock inference profile id — an AWS resource naming a model, not the ~/.aws named profile $AWS_PROFILE selects: pass -model or set $PORKCHOP_MODEL (commercial: us.anthropic.claude-sonnet-4-5-20250929-v1:0; GovCloud: us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0); list them with `aws bedrock list-inference-profiles --region <region>`")
 		}
 		// A Bedrock API key carries no region, and fantasy defaults a missing
 		// one to commercial us-east-1. In GovCloud — or any partition that is
