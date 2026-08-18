@@ -36,8 +36,9 @@ perfectly good thing for a hook to encounter.
 Flags:
   -provider name  Inference backend: bedrock (default), anthropic, openai,
                   openai-compat.
-  -model string   Model id (default $PORKCHOP_MODEL, then $MEAT_MODEL). Bedrock
-                  needs a full inference profile id and has no default.
+  -model string   Model id (default $PORKCHOP_MODEL, then $MEAT_MODEL). For
+                  bedrock this is a Bedrock inference profile id, not the named
+                  profile in ~/.aws/config that $AWS_PROFILE selects.
   -region string  AWS region for bedrock; required with a Bedrock API key
                   ($AWS_BEARER_TOKEN_BEDROCK), which carries no region.
   -base-url url   Endpoint override; required for openai-compat, and the way to
