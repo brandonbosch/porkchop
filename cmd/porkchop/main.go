@@ -75,6 +75,16 @@ Per-file "viewed" markers (v in the TUI) persist under the cache directory, keye
 to each file's own content, so they survive a range growing as an agent commits.
 
 Flags:
+  -preset name    Use a named backend preset from ~/.config/porkchop/config.json
+                  (default $PORKCHOP_PRESET, then the file's default_preset).
+                  A preset stores -provider/-model/-region/-base-url together,
+                  so switching backends is one word instead of four flags. Any
+                  flag or environment variable you also give still wins over it.
+                  Presets are read from your config only — never from the repo
+                  under review, which must not get to choose where its own diff
+                  is sent.
+  -write-config   Write a starter config file with example presets and exit.
+                  Refuses to overwrite an existing one.
   -provider name  Inference backend: bedrock (default), anthropic, openai,
                   openai-compat. Bedrock is the default because everything sent
                   to a model here — the diff, and the surrounding source meat's
@@ -107,6 +117,9 @@ Flags:
   -h, --help      Show this help.
 
 Environment:
+  PORKCHOP_PRESET                      Default preset name (see -preset).
+  PORKCHOP_CONFIG                      Config file path, overriding the XDG
+                                       location ~/.config/porkchop/config.json.
   PORKCHOP_PROVIDER                    Default backend (see -provider).
   PORKCHOP_MODEL                       Default model id; read before MEAT_MODEL,
                                        so a machine that also runs plain meat can
@@ -120,6 +133,12 @@ Environment:
                                        flag, because a secret on a command line
                                        is visible to every process on the box.
   ANTHROPIC_API_KEY / OPENAI_API_KEY   API key, for those providers only.
+  PORKCHOP_API_KEY                     API key for openai-compat, when the local
+                                       server enforces one (oMLX and vLLM do;
+                                       Ollama and llama.cpp do not). Env only,
+                                       for the same reason as the Bedrock token.
+                                       A preset can name a different variable
+                                       with "api_key_env".
   MEAT_MODEL                           Fallback default model id.
   MEAT_CACHE                           Optional cache dir (default ~/.meat; empty disables).
 `
@@ -217,11 +236,25 @@ func runReview(args []string) {
 	jsonOut := fs.Bool("json", false, "emit the result as JSON on stdout")
 	plain := fs.Bool("plain", false, "force plain-text output instead of the TUI")
 	readingDiffFile := fs.String("reading-diff", "", "offline/dev: render a pre-computed reading diff from a file, skipping meat and the LLM")
+	writeConfig := fs.Bool("write-config", false, "write a starter preset config file and exit")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			os.Exit(0)
 		}
 		os.Exit(2)
+	}
+
+	// A flag rather than a "porkchop config" subcommand: only "process" and
+	// "hook" are reserved words, and "config" is a far more plausible branch
+	// name than either. Reserving it would shadow a real branch for the sake of
+	// a one-time action.
+	if *writeConfig {
+		path, err := writeStarterConfig()
+		if err != nil {
+			fatal("%v", err)
+		}
+		fmt.Fprintf(os.Stderr, "porkchop: wrote %s — edit it, then use -preset <name>\n", path)
+		return
 	}
 
 	// diff is the raw pre-abridgement unified diff; res is the abridged result.
@@ -234,7 +267,7 @@ func runReview(args []string) {
 	if *readingDiffFile != "" {
 		diff, res = loadReadingDiff(*readingDiffFile)
 	} else {
-		diff, res = computeResult(fs.Args(), *staged, *worktree, backend.config(), *noCache, *jsonOut)
+		diff, res = computeResult(fs.Args(), *staged, *worktree, backend, *noCache, *jsonOut)
 	}
 
 	elision := meat.ElisionLine(diff, res.SmartDiff)
@@ -259,7 +292,7 @@ func runReview(args []string) {
 // computeResult reads the raw diff for the given selection and returns it with
 // meat's abridged result, hitting the shared ~/.meat cache first and computing
 // via the LLM (needs credentials) only on a miss.
-func computeResult(args []string, staged, worktree bool, backend model.Config, noCache, jsonOut bool) (string, *meat.Result) {
+func computeResult(args []string, staged, worktree bool, flags *backendFlags, noCache, jsonOut bool) (string, *meat.Result) {
 	diff, source, err := gitx.ReadDiff(args, staged, worktree)
 	if err != nil {
 		fatalReadDiff(args, err)
@@ -281,7 +314,7 @@ func computeResult(args []string, staged, worktree bool, backend model.Config, n
 	// the key, so a Bedrock inference profile and a public claude-opus-4-8 are
 	// distinct entries and cannot collide. Resolution is offline — no
 	// credentials are touched until there is actually work to do.
-	backend, err = model.Resolve(backend)
+	backend, err := flags.resolve()
 	if err != nil {
 		fatal("%v", err)
 	}
@@ -294,6 +327,9 @@ func computeResult(args []string, staged, worktree bool, backend model.Config, n
 		}
 	}
 
+	if !jsonOut {
+		fmt.Fprintf(os.Stderr, "porkchop: using %s\n", describeBackend(backend))
+	}
 	m, err := model.Open(ctx, backend)
 	if err != nil {
 		fatal("%v", err)
