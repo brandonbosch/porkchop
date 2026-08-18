@@ -42,8 +42,24 @@ type styles struct {
 	// Trust affordances. A marker announces hidden content and has to read as an
 	// action, not as diff content — amber, and brighter still under the cursor so
 	// there is never doubt about which one `e` will expand.
-	marker    lipgloss.Style // an elision marker (amber)
-	markerCur lipgloss.Style // the marker the cursor is on (bold amber)
+	//
+	// Markers are tiered by what they hide, because a screen where every marker is
+	// the same amber makes the reviewer read all of them to find the ones that
+	// matter — which is the cost the wording was supposed to remove. Amber is the
+	// alert and is reserved for hidden code. The quiet tiers step down a gray ramp
+	// whose top rung is not an invention: `dim` is GitHub's own syntax-comment
+	// color, the shade every editor already paints comments in, so a marker hiding
+	// commentary is drawn the color of the thing behind it. Blank steps down again
+	// to `faint`, because an empty line has less to say than a comment does.
+	//
+	// The tier never changes under the cursor, only the weight: a hue that shifted
+	// as the caret moved would make the category unreadable while navigating.
+	marker         lipgloss.Style // hides real code (amber)
+	markerCur      lipgloss.Style // ... under the cursor (bold amber)
+	markerProse    lipgloss.Style // hides only commentary (comment gray)
+	markerProseCur lipgloss.Style
+	markerQuiet    lipgloss.Style // hides only blank lines, or no change at all (faint)
+	markerQuietCur lipgloss.Style
 
 	// Expanded original content is deliberately quieter than the reading diff:
 	// it is there to be checked, not read. Polarity survives, saturation does not.
@@ -124,8 +140,15 @@ func newStyles(dark bool) styles {
 		matchEmph: lipgloss.NewStyle().Foreground(matchFg).Background(matchBg).Underline(true),
 		prompt:    lipgloss.NewStyle().Foreground(amber).Bold(true),
 
-		marker:    lipgloss.NewStyle().Foreground(amber).Italic(true),
-		markerCur: lipgloss.NewStyle().Foreground(amber).Bold(true),
+		marker:         lipgloss.NewStyle().Foreground(amber).Italic(true),
+		markerCur:      lipgloss.NewStyle().Foreground(amber).Bold(true),
+		markerProse:    lipgloss.NewStyle().Foreground(dim).Italic(true),
+		markerProseCur: lipgloss.NewStyle().Foreground(dim).Bold(true),
+		// Faint on top of an already-faint color, since this tier is telling the
+		// reviewer there is nothing here. Dropped under the cursor, where bold and
+		// faint fight each other in most terminals.
+		markerQuiet:    lipgloss.NewStyle().Foreground(faint).Italic(true).Faint(true),
+		markerQuietCur: lipgloss.NewStyle().Foreground(faint).Bold(true),
 
 		hidden:       lipgloss.NewStyle().Foreground(faint),
 		hiddenAdd:    lipgloss.NewStyle().Foreground(mutedGreen),
@@ -140,5 +163,28 @@ func newStyles(dark bool) styles {
 		tileHidden: tile.Foreground(amber).Bold(true),
 		rule:       lipgloss.NewStyle().Foreground(faint),
 		footer:     lipgloss.NewStyle().Foreground(dim),
+	}
+}
+
+// forMarker resolves the style of a marker of kind k. It is the only place the
+// tiering is applied, so the color a marker gets and the words it carries cannot
+// drift apart — both come from kindOf.
+func (s styles) forMarker(k markerKind, cur bool) lipgloss.Style {
+	switch k {
+	case markerProse:
+		if cur {
+			return s.markerProseCur
+		}
+		return s.markerProse
+	case markerEmpty, markerContext:
+		if cur {
+			return s.markerQuietCur
+		}
+		return s.markerQuiet
+	default:
+		if cur {
+			return s.markerCur
+		}
+		return s.marker
 	}
 }

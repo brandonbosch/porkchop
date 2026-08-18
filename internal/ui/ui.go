@@ -136,6 +136,11 @@ type Model struct {
 	// (they are trimmed context, not hidden change) but are worth reporting.
 	contextOnly int
 
+	// restated marks the git header rows a file banner stands in for, and banners
+	// holds those banners by the "diff --git" row that opens each file.
+	restated []bool
+	banners  map[int]*fileBanner
+
 	// body is the rendered review view as semantic lines; markerLine maps each
 	// mark to its line index in body, and rowLine each row to the line it is shown
 	// on, both so a jump can be turned into a scroll offset.
@@ -171,6 +176,10 @@ const (
 	// bodyPair is one line of the two-column view, carrying a cell per side. It
 	// replaces bodyRow for source lines when the split view is showing.
 	bodyPair
+	// bodyBanner is the in-flow separator that opens a file, standing in for the
+	// git header rows it restates. bodySpacer is the blank line above it.
+	bodyBanner
+	bodySpacer
 )
 
 // bodyLine is one line of the review view before styling. row and mark are
@@ -185,6 +194,11 @@ type bodyLine struct {
 	// filler (Row < 0). They are unset for every other kind.
 	left  diffview.Cell
 	right diffview.Cell
+	// spanRows are the additional rows this line stands in for, beyond row. Only
+	// a banner has them: it replaces a run of header rows with one separator, and
+	// listing them here is what keeps "every row is accounted for exactly once"
+	// true of a view that draws fewer lines than it has rows.
+	spanRows []int
 }
 
 // rows returns the row indices this line accounts for, which is what lets a test
@@ -192,7 +206,7 @@ type bodyLine struct {
 func (bl bodyLine) rows() []int {
 	if bl.kind != bodyPair {
 		if bl.row >= 0 {
-			return []int{bl.row}
+			return append([]int{bl.row}, bl.spanRows...)
 		}
 		return nil
 	}
@@ -494,6 +508,16 @@ func (m *Model) buildUnifiedBody() []bodyLine {
 			out = m.emitMark(out, mark, i)
 			continue
 		}
+		if bl, ok := m.bannerLine(i); ok {
+			if len(out) > 0 {
+				out = append(out, bodyLine{kind: bodySpacer, row: -1, mark: -1})
+			}
+			out = append(out, bl)
+			continue
+		}
+		if m.restated[i] {
+			continue
+		}
 		out = append(out, bodyLine{kind: bodyRow, row: i, mark: -1, text: r.Text})
 	}
 	// An elision after the last row anchors at len(rows).
@@ -541,6 +565,16 @@ func (m *Model) buildSplitBody() []bodyLine {
 			continue
 		}
 		if l.Kind == diffview.SplitFull {
+			if bl, ok := m.bannerLine(l.Row); ok {
+				if len(out) > 0 {
+					out = append(out, bodyLine{kind: bodySpacer, row: -1, mark: -1})
+				}
+				out = append(out, bl)
+				continue
+			}
+			if m.restated[l.Row] {
+				continue
+			}
 			out = append(out, bodyLine{kind: bodyRow, row: l.Row, mark: -1, text: m.rows[l.Row].Text})
 			continue
 		}
@@ -550,6 +584,17 @@ func (m *Model) buildSplitBody() []bodyLine {
 		out = m.emitMark(out, mark, -1)
 	}
 	return out
+}
+
+// bannerLine is the body line that opens the file starting at row, if one does.
+// It carries every header row it replaces, so the body still accounts for each of
+// them exactly once — the banner *is* those rows, drawn as one line.
+func (m Model) bannerLine(row int) (bodyLine, bool) {
+	b, ok := m.banners[row]
+	if !ok {
+		return bodyLine{}, false
+	}
+	return bodyLine{kind: bodyBanner, row: row, mark: -1, text: b.label, spanRows: b.rows}, true
 }
 
 // emitMark appends a marker and, when it is expanded, the original lines it hides.
@@ -564,9 +609,37 @@ func (m *Model) emitMark(out []bodyLine, mark, row int) []bodyLine {
 	return out
 }
 
+// markerKind is what an elision hides. It drives the marker's wording and its
+// color, from this one classification on purpose: a marker that reads "comment"
+// but is painted like code — or the reverse — is worse than either signal alone,
+// because a reviewer who learns the colors stops reading the words.
+type markerKind uint8
+
+const (
+	markerCode    markerKind = iota // hides real code — the amber warning
+	markerProse                     // hides nothing but commentary
+	markerEmpty                     // hides nothing but blank lines
+	markerContext                   // hides no changed line at all
+)
+
+func kindOf(e diffview.Elision) markerKind {
+	switch {
+	case e.Changed == 0:
+		return markerContext
+	case e.Blank == e.Changed:
+		return markerEmpty
+	case e.Comment > 0 && e.Comment+e.Blank == e.Changed:
+		return markerProse
+	default:
+		return markerCode
+	}
+}
+
 // markerText describes what a marker hides and how to act on it. The wording
 // leads with the count of *changed* lines because that is the number a reviewer
-// is deciding whether to trust.
+// is deciding whether to trust — except where the hidden lines are all blank or
+// all commentary, when it leads with that instead, since the decision the marker
+// exists to inform is "is this worth an expand".
 func (m Model) markerText(i int) string {
 	e := m.marks[i]
 	glyph, hint := "▸", "e expand"
@@ -574,25 +647,42 @@ func (m Model) markerText(i int) string {
 		glyph, hint = "▾", "e collapse"
 	}
 
+	// The wording names the most specific thing the marker can honestly claim,
+	// because what the reviewer is deciding is whether to spend an expand. Both
+	// special cases below are still drawn and still counted, so the header's
+	// "N hidden in M spots" continues to reconcile with what is on screen —
+	// suppressing them would not.
+	kind := kindOf(e)
 	var what string
-	switch {
-	case e.Changed > 0 && e.Blank == e.Changed:
+	var qual []string
+	switch kind {
+	case markerEmpty:
 		// Everything this marker hides is an empty line. Saying so costs the same
 		// row and tells the reviewer there is nothing behind it, rather than
-		// inviting an expand that reveals whitespace. The marker is still drawn and
-		// still counted, so the header's "N hidden in M spots" continues to
-		// reconcile with what is on screen — suppressing it would not.
+		// inviting an expand that reveals whitespace.
 		what = fmt.Sprintf("%d blank %s", e.Blank, plural(e.Blank, "line", "lines"))
-		if n := e.Len() - e.Changed; n > 0 {
-			what += fmt.Sprintf(" (+%d context)", n)
+	case markerProse:
+		// Nothing here but prose: a docstring, a block of "#" lines, a license
+		// header. Worth an expand sometimes — a comment can be the whole point of
+		// a change — but it is the reviewer's call to make from the marker rather
+		// than after paying for it, which is the same bargain the blank case
+		// offers. Comment and Blank are disjoint, so the two counts sum to Changed.
+		what = fmt.Sprintf("%d comment %s", e.Comment, plural(e.Comment, "line", "lines"))
+		if e.Blank > 0 {
+			qual = append(qual, fmt.Sprintf("+%d blank", e.Blank))
 		}
-	case e.Changed > 0:
-		what = fmt.Sprintf("%d changed %s", e.Changed, plural(e.Changed, "line", "lines"))
-		if n := e.Len() - e.Changed; n > 0 {
-			what += fmt.Sprintf(" (+%d context)", n)
-		}
-	default:
+	case markerContext:
 		what = fmt.Sprintf("%d context %s", e.Len(), plural(e.Len(), "line", "lines"))
+	default:
+		what = fmt.Sprintf("%d changed %s", e.Changed, plural(e.Changed, "line", "lines"))
+	}
+	if kind != markerContext {
+		if n := e.Len() - e.Changed; n > 0 {
+			qual = append(qual, fmt.Sprintf("+%d context", n))
+		}
+	}
+	if len(qual) > 0 {
+		what += " (" + strings.Join(qual, ", ") + ")"
 	}
 	if !m.expanded[i] {
 		what += " hidden"
@@ -722,7 +812,10 @@ func (m Model) renderAudit() string {
 		for _, e := range g.changeBearing {
 			label := fmt.Sprintf("  ▾ %d changed, %d total  ·  original lines %d-%d",
 				e.Changed, e.Len(), e.RawStart+1, e.RawEnd)
-			b.WriteString(m.clamp(m.st.marker).Render(label))
+			// Tiered the same way as in the review view. The audit still lists
+			// every hidden line under every heading — the color only says which
+			// headings are worth reading first.
+			b.WriteString(m.clamp(m.st.forMarker(kindOf(e), false)).Render(label))
 			b.WriteByte('\n')
 			for _, line := range m.align.Hidden(e) {
 				b.WriteString(m.clamp(m.st.hiddenGutter).Render("    │"))
@@ -991,25 +1084,103 @@ func numberWidth(nums []diffview.LineNo) int {
 // and what the breadcrumb reads.
 func (m *Model) indexFiles() {
 	m.rowFile = make([]int, len(m.rows))
-	cur := -1
+	m.restated = make([]bool, len(m.rows))
+	m.banners = map[int]*fileBanner{}
+	cur, banner := -1, (*fileBanner)(nil)
 	for i, r := range m.rows {
 		switch {
 		case r.Kind == diffview.RowHunk:
 			m.hunkRows = append(m.hunkRows, i)
+			banner = nil
 		case r.Kind == diffview.RowMeta && strings.HasPrefix(r.Text, "diff --git "):
 			cur = len(m.files)
 			name, _ := diffview.FileOf(r.Text)
 			m.files = append(m.files, name)
 			m.fileRows = append(m.fileRows, i)
+			banner = &fileBanner{label: name}
+			m.banners[i] = banner
+			if old, new, ok := diffview.GitHeaderPaths(r.Text); ok {
+				banner.old, banner.new = old, new
+				if trimSide(old) != trimSide(new) {
+					// A rename is the one case where the two paths are not the same
+					// fact twice, so the banner has to carry both.
+					banner.label = trimSide(old) + " → " + trimSide(new)
+					banner.renamed = true
+				}
+			}
 		case r.Kind == diffview.RowMeta && strings.HasPrefix(r.Text, "+++ ") && cur >= 0:
 			// "+++ b/path" names exactly one path, so it is preferred over the
 			// two-path "diff --git" line whenever it turns up.
 			if name, ok := diffview.FileOf(r.Text); ok {
 				m.files[cur] = name
+				if banner != nil && !banner.renamed {
+					banner.label = name
+				}
 			}
+		case r.Kind != diffview.RowMeta:
+			banner = nil
+		}
+		// Header rows the banner already says are folded into it. Everything else
+		// git chose to emit — a mode change, a new or deleted file, a similarity
+		// index, a binary marker — is content the banner does not carry, and stays.
+		if banner != nil && banner.restates(r) {
+			m.restated[i] = true
+			banner.rows = append(banner.rows, i)
 		}
 		m.rowFile[i] = cur
 	}
+}
+
+// fileBanner is the one-line separator that opens a file in the body, and the
+// record of which header rows it stands in for.
+//
+// Collapsing the block is not the same kind of act as meat's eliding: a git
+// header carries no line of the change, and the banner restates every path in it.
+// So the rule is exactly that — a row is folded into the banner only when the
+// banner already says what it says. `index <sha>..<sha>` goes because the blob
+// hashes are not usable from inside a reader and the mode it trails is repeated
+// by the "new file mode"/"old mode" lines whenever it is news; "---" and "+++" go
+// only when they name the paths the banner is already showing, which leaves
+// /dev/null (an add or a delete) on screen where it belongs.
+type fileBanner struct {
+	label    string
+	old, new string
+	renamed  bool
+	rows     []int
+}
+
+func (b *fileBanner) restates(r diffview.Row) bool {
+	if r.Kind != diffview.RowMeta {
+		return false
+	}
+	switch {
+	case strings.HasPrefix(r.Text, "index "):
+		return true
+	case strings.HasPrefix(r.Text, "--- "):
+		return metaPath(r.Text, "--- ") == b.old
+	case strings.HasPrefix(r.Text, "+++ "):
+		return metaPath(r.Text, "+++ ") == b.new
+	}
+	return false
+}
+
+// metaPath is the path a "---"/"+++" line names, with git's optional trailing
+// timestamp field removed.
+func metaPath(line, prefix string) string {
+	rest := strings.TrimPrefix(line, prefix)
+	rest, _, _ = strings.Cut(rest, "\t")
+	return rest
+}
+
+// trimSide drops the "a/" or "b/" git prefixes a header path carries.
+func trimSide(p string) string {
+	if rest, ok := strings.CutPrefix(p, "a/"); ok {
+		return rest
+	}
+	if rest, ok := strings.CutPrefix(p, "b/"); ok {
+		return rest
+	}
+	return p
 }
 
 // topRow is the first row at or below the top of the viewport — what "where the

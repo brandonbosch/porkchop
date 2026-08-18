@@ -75,13 +75,53 @@ func TestRenderBodyLossless(t *testing.T) {
 			plain := ansi.Strip(m.renderBody())
 			gotLines := strings.Split(plain, "\n")
 
-			if len(gotLines) != len(m.rows) {
-				t.Fatalf("rendered %d lines, want %d rows", len(gotLines), len(m.rows))
+			if len(gotLines) != len(m.body) {
+				t.Fatalf("rendered %d lines, want %d body lines", len(gotLines), len(m.body))
 			}
+
+			// Every row is accounted for exactly once — as itself, or by the file
+			// banner that stands in for it — and every row that is not folded into
+			// a banner still renders verbatim.
+			seen := make([]int, len(m.rows))
+			for i, bl := range m.body {
+				for _, r := range bl.rows() {
+					seen[r]++
+				}
+				if bl.kind != bodyRow {
+					continue
+				}
+				if want := expandTabs(m.rows[bl.row].Text, tabWidth); gotLines[i] != want {
+					t.Errorf("row %d: rendered %q, want %q", bl.row, gotLines[i], want)
+				}
+			}
+			for i, n := range seen {
+				if n != 1 {
+					t.Fatalf("row %d (%q) accounted for %d times, want 1", i, m.rows[i].Text, n)
+				}
+			}
+
+			// Only the header lines a banner restates may be folded away. Anything
+			// else git emitted — a mode change, a new or deleted file, a binary
+			// marker — carries something the banner does not, and must survive.
 			for i, r := range m.rows {
-				want := expandTabs(r.Text, tabWidth)
-				if gotLines[i] != want {
-					t.Errorf("row %d: rendered %q, want %q", i, gotLines[i], want)
+				if !m.restated[i] {
+					continue
+				}
+				switch {
+				case strings.HasPrefix(r.Text, "index "):
+				case strings.HasPrefix(r.Text, "--- "), strings.HasPrefix(r.Text, "+++ "):
+					if strings.Contains(r.Text, "/dev/null") {
+						t.Errorf("row %d folded away %q, which says the file was added or deleted", i, r.Text)
+					}
+				default:
+					t.Errorf("row %d folded away %q, which no banner restates", i, r.Text)
+				}
+			}
+
+			// ... and every file still announces itself somewhere on screen.
+			for _, f := range m.files {
+				if f != "" && !strings.Contains(plain, f) {
+					t.Errorf("file %q has no banner in the body", f)
 				}
 			}
 		})
@@ -131,11 +171,21 @@ func TestRenderFrameGoldens(t *testing.T) {
 			if !strings.Contains(plain, "quit") {
 				t.Errorf("frame missing footer hints")
 			}
-			// The viewport shows the top of the diff: its first content line
-			// must be present in the rendered frame.
-			first := expandTabs(m.rows[0].Text, tabWidth)
-			if !strings.Contains(plain, first) {
-				t.Errorf("frame missing first diff row %q", first)
+			// The viewport shows the top of the diff: the first file's banner and
+			// the first line of content under it must both be present.
+			if len(m.files) == 0 {
+				t.Fatal("no files indexed")
+			}
+			if !strings.Contains(plain, m.files[0]) {
+				t.Errorf("frame missing the first file's banner %q", m.files[0])
+			}
+			for _, r := range m.rows {
+				if r.Kind == diffview.RowHunk {
+					if first := expandTabs(r.Text, tabWidth); !strings.Contains(plain, first) {
+						t.Errorf("frame missing first hunk header %q", first)
+					}
+					break
+				}
 			}
 			t.Logf("%s: %s", filepath.Base(goldenPath), elision)
 		})

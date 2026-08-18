@@ -89,6 +89,17 @@ func (m Model) displayCell(bl bodyLine, side int) (string, []diffview.Span) {
 
 	avail := m.width - m.prefixCells(bl)
 	switch bl.kind {
+	case bodySpacer:
+		return "", nil
+	case bodyBanner:
+		// The label is the searchable part; the rule beside it is furniture, and
+		// reserving room for it here keeps a long path from eating the whole line.
+		// A width of zero still means "no truncation", as it does for every other
+		// kind, so the reservation only applies once there is a width to divide.
+		if avail > 0 {
+			avail = max(avail-bannerRule-2, 1)
+		}
+		return prepare(bl.text, avail, nil)
 	case bodyMarker, bodyHidden:
 		return prepare(bl.text, avail, nil)
 	default:
@@ -105,12 +116,21 @@ func (m Model) displayCell(bl bodyLine, side int) (string, []diffview.Span) {
 // unnumbered lines start further left, produces a ragged margin that reads as a
 // rendering fault rather than as a distinction.
 func (m Model) prefixCells(bl bodyLine) int {
-	if bl.kind == bodyHidden {
+	switch bl.kind {
+	case bodyHidden:
 		// One cell more for the "│" rail that sets revealed content apart.
 		return m.gutterCells() + 1
+	case bodyBanner, bodySpacer:
+		// A file banner is furniture for the whole width, not a line of diff, so
+		// it starts at the left margin rather than inside the gutter's column.
+		return 0
 	}
 	return m.gutterCells()
 }
+
+// bannerRule is the minimum number of cells of rule drawn to the right of a file
+// banner's name, so the separator still reads as a separator on a narrow terminal.
+const bannerRule = 4
 
 // spansOf is row's intra-line spans, or nil when it has none.
 func (m Model) spansOf(row int) []diffview.Span {
@@ -132,12 +152,28 @@ func (m Model) renderBodyLine(i int, bl bodyLine) string {
 	case bodyMarker:
 		// The current marker carries a caret; others get matching blanks so the
 		// marker text stays in one column as the cursor moves.
-		prefix, style := "  ", m.st.marker
-		if bl.mark == m.cur {
-			prefix, style = "❯ ", m.st.markerCur
+		prefix, cur := "  ", bl.mark == m.cur
+		if cur {
+			prefix = "❯ "
 		}
+		style := m.st.forMarker(kindOf(m.marks[bl.mark]), cur)
 		return strings.Repeat(" ", m.gutterCells()) +
 			m.paint(text, style, style, nil, m.hitsAt(i, sideOld), prefix)
+
+	case bodySpacer:
+		return ""
+
+	case bodyBanner:
+		// The file's name at the left margin, where the eye scans, with a rule
+		// running out to the right edge. Left-flush rather than centred in the rule
+		// like the header's breadcrumb: this one marks where a file *begins*, and
+		// the two should not be mistaken for each other.
+		name := m.paint(text, m.st.fileHeader, m.st.fileHeader, nil, m.hitsAt(i, sideOld), "")
+		tail := m.width - lipgloss.Width(text) - 1
+		if tail < bannerRule {
+			return name
+		}
+		return name + " " + m.st.rule.Render(strings.Repeat("─", tail))
 
 	case bodyHidden:
 		// Expanded original content is set apart by a rail and dimmed: this is what
