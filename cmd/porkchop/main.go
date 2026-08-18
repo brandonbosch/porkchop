@@ -16,6 +16,8 @@
 //	porkchop -staged         Review the staged (index) changes.
 //	porkchop -w              Review the unstaged working-tree changes.
 //	git show <sha> | porkchop   Review the diff piped on stdin.
+//	porkchop process [rev]   Abridge and cache without opening anything.
+//	porkchop hook install    Warm the cache from a post-commit hook.
 //
 // It reads OPENAI_API_KEY or ANTHROPIC_API_KEY from the environment (optionally
 // the matching provider base URL, plus MEAT_MODEL / -model), exactly like meat.
@@ -46,11 +48,27 @@ Usage:
   porkchop -w              Review the unstaged working-tree changes: git diff.
   git show <sha> | porkchop   Review the diff piped on stdin.
 
+Commands:
+  porkchop process [rev|range]   Abridge and cache, printing one line and opening
+                                 nothing. The entry point for hooks and agent
+                                 devtools; see -json.
+  porkchop hook install          Install a post-commit hook that warms the cache
+                                 for each new commit in the background, without
+                                 delaying or ever failing the commit.
+  porkchop hook uninstall        Remove it.
+  porkchop hook status           Report whether it is installed.
+
+  Run a command with -h for its own flags. A revision literally named "process"
+  or "hook" can still be reviewed as "porkchop -- process".
+
 porkchop reads a unified diff, asks meat's core to abridge it into a reading
 diff, and presents it in a TUI. On a terminal it opens the review screen; when
 stdout is redirected it prints plain text so pipes still work. Results are
 cached under ~/.meat with the same key meat uses, so a commit processed by
 either tool is an instant cache hit for the other.
+
+Per-file "viewed" markers (v in the TUI) persist under the cache directory, keyed
+to each file's own content, so they survive a range growing as an agent commits.
 
 Flags:
   -model string   Model to use (default $MEAT_MODEL or a built-in default).
@@ -73,6 +91,54 @@ Environment:
 `
 
 func main() {
+	args := os.Args[1:]
+	// Subcommand dispatch happens before flag parsing, so it must be exact: only a
+	// bare "process" or "hook" in first position is a command. Everything else —
+	// including a flag, a sha, or a range — is the review command, which is what
+	// porkchop is for and what meat's arguments mean. "--" forces review, for the
+	// unlucky repo with a branch named after a command.
+	if len(args) > 0 {
+		switch args[0] {
+		case "process":
+			runProcess(args[1:])
+			return
+		case "hook":
+			runHook(args[1:])
+			return
+		case "--":
+			args = args[1:]
+		}
+	}
+	runReview(args)
+}
+
+// parseFlexible parses fs over args, accepting flags before or after the positional
+// arguments, and returns the positionals in order.
+//
+// Go's flag package stops parsing at the first non-flag word, which makes
+// "porkchop hook install -force" and "porkchop process HEAD -json" — the orders a
+// person actually types — into silent usage errors. The workflow commands are new
+// and owe nothing to anyone's muscle memory, so they accept either order. The review
+// command deliberately does not: it has to accept meat's arguments exactly as meat
+// does, and a revision is allowed to look like anything.
+func parseFlexible(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		rest := fs.Args()
+		if len(rest) == 0 {
+			return positional, nil
+		}
+		positional = append(positional, rest[0])
+		args = rest[1:]
+	}
+}
+
+// runReview is porkchop proper: read a diff, abridge it, and open the review
+// screen (or print it, when stdout is not a terminal).
+func runReview(args []string) {
 	fs := flag.NewFlagSet("porkchop", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
@@ -83,7 +149,7 @@ func main() {
 	jsonOut := fs.Bool("json", false, "emit the result as JSON on stdout")
 	plain := fs.Bool("plain", false, "force plain-text output instead of the TUI")
 	readingDiffFile := fs.String("reading-diff", "", "offline/dev: render a pre-computed reading diff from a file, skipping meat and the LLM")
-	if err := fs.Parse(os.Args[1:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			os.Exit(0)
 		}
@@ -113,6 +179,7 @@ func main() {
 			Elision:     elision,
 			ReadingDiff: res.SmartDiff,
 			RawDiff:     diff,
+			Viewed:      openViewed(),
 		}); err != nil {
 			fatal("%v", err)
 		}

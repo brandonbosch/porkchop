@@ -112,6 +112,7 @@ func Align(raw, readingDiff string) Alignment {
 	// start at -1 so a diff whose opening lines were dropped yields a leading
 	// elision, and the tail is closed after the loop.
 	files := rawFileNames(rawRows)
+	a.Digests = fileDigests(rawRows, files)
 	prevRow, prevRaw := -1, -1
 	for _, m := range matches {
 		if m.raw-prevRaw > 1 {
@@ -199,6 +200,12 @@ type Alignment struct {
 	// structural rows, for fold rows, for either side of a row that exists on
 	// only one side, and for every row when no original was supplied.
 	Nums []LineNo
+	// Digests gives each file in the original diff a content identity: a hash of
+	// that file's own section of it. It is what a persisted "viewed" marker is
+	// keyed to, so a marker survives the rest of the change moving underneath it.
+	// Nil when no original was supplied, in which case markers cannot be
+	// persisted at all — see fileDigests.
+	Digests map[string]string
 }
 
 // LineNo is a row's position in the pre-image and post-image of the change.

@@ -53,9 +53,11 @@ type styles struct {
 	hiddenGutter lipgloss.Style // the "│" rail marking revealed content
 
 	summary    lipgloss.Style // header title line
+	viewed     lipgloss.Style // the check on a file the reviewer has signed off
 	tile       lipgloss.Style // a neutral stat tile
 	tileKept   lipgloss.Style // the retained-lines stat tile (emphasized)
 	tileHidden lipgloss.Style // the hidden-changed-lines tile (amber, the warning)
+	tileViewed lipgloss.Style // the review-progress tile (green)
 	rule       lipgloss.Style // the thin divider under the header
 	footer     lipgloss.Style // the keybinding/scroll footer
 }
@@ -131,6 +133,8 @@ func newStyles(dark bool) styles {
 		hiddenGutter: lipgloss.NewStyle().Foreground(amber).Faint(true),
 
 		summary:    lipgloss.NewStyle().Bold(true),
+		viewed:     lipgloss.NewStyle().Foreground(green).Bold(true),
+		tileViewed: tile.Foreground(green),
 		tile:       tile.Foreground(dim),
 		tileKept:   tile.Bold(true),
 		tileHidden: tile.Foreground(amber).Bold(true),

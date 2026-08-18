@@ -68,6 +68,9 @@ type Input struct {
 	// reading diff rendered with no original available) the screen degrades
 	// cleanly to the unified view with no markers.
 	RawDiff string
+	// Viewed persists the per-file "viewed" markers across sessions. Nil is
+	// allowed and means the markers live only as long as this screen does.
+	Viewed ViewedStore
 }
 
 // Run launches the review screen and blocks until the reviewer quits.
@@ -106,6 +109,13 @@ type Model struct {
 	fileRows []int
 	hunkRows []int
 	rowFile  []int
+
+	// Per-file "viewed" markers, parallel to files: viewed is this session's
+	// state, digests the content identity each marker is keyed to, and vs the
+	// place they persist (nil for session-only).
+	viewed  []bool
+	digests []string
+	vs      ViewedStore
 
 	// Search. query is the committed or in-progress needle, hits every match on
 	// screen in reading order, and hitIndex the same matches keyed by content area
@@ -219,11 +229,13 @@ func New(in Input) Model {
 		hitCur:       -1,
 		dark:         true,
 		st:           newStyles(true),
+		vs:           in.Viewed,
 	}
 	m.rows = m.align.Rows
 	m.lay = diffview.Split(m.rows)
 	m.numDigits = numberWidth(m.align.Nums)
 	m.indexFiles()
+	m.initViewed()
 
 	// A marker is worth drawing when the elision hides real change, or when meat
 	// itself flagged it — in which case hiding the flag would be a regression
@@ -303,7 +315,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.vp.GotoTop()
 			return m, nil
 		case "G", "end":
-			m.vp.GotoBottom()
+			m.gotoBottom()
 			return m, nil
 		case "]":
 			m.stepAnchor(m.fileRows, 1)
@@ -336,6 +348,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "p":
 			m.stepMark(-1)
+			return m, nil
+		case "v":
+			m.toggleViewed()
+			return m, nil
+		case "tab":
+			m.stepUnviewed()
 			return m, nil
 		case "e":
 			m.toggleCurrent()
@@ -398,7 +416,25 @@ func (m *Model) setContent() {
 		m.vp.SetContent(m.renderAudit())
 		return
 	}
-	m.vp.SetContent(m.renderBody())
+	// The body is followed by blank lines so that every line of it — including the
+	// last file's header — can be scrolled to the top of the screen.
+	//
+	// Without them the final screenful of a long change is unreachable as a scroll
+	// position: the viewport correctly refuses to scroll past its content, so the
+	// last few files never reach the top, the breadcrumb can never name them, and
+	// `v` can never check them off. That costs nothing on a six-file fixture that
+	// fits the screen and makes the last files of a twenty-file change unreviewable.
+	// Editors scroll past the end for the same reason.
+	m.vp.SetContent(m.renderBody() + strings.Repeat("\n", m.tailPad()))
+}
+
+// tailPad is how many blank lines follow the body: enough for its last line to sit
+// at the top of the screen, and no more.
+func (m Model) tailPad() int {
+	if m.audit {
+		return 0
+	}
+	return max(m.vp.Height()-1, 0)
 }
 
 // rebuild recomputes the review view's line model. Called whenever the expansion
@@ -710,6 +746,11 @@ func (m Model) renderHeader() string {
 	if hidden := m.align.ChangedHidden(); hidden > 0 {
 		tiles = append(tiles, m.st.tileHidden.Render(fmt.Sprintf("%d hidden in %d spots", hidden, len(m.marks))))
 	}
+	// Review progress, once there is any. It sits with the trust stats rather than
+	// in the footer because it is state, not a keybinding.
+	if tile := m.viewedTile(); tile != "" {
+		tiles = append(tiles, m.st.tileViewed.Render(tile))
+	}
 	if m.rawBytes > 0 {
 		saved := m.rawBytes - m.readingBytes
 		pct := saved * 100 / m.rawBytes
@@ -718,7 +759,10 @@ func (m Model) renderHeader() string {
 	} else {
 		tiles = append(tiles, m.st.tile.Render(fmt.Sprintf("%d rows", len(m.rows))))
 	}
-	bar := lipgloss.JoinHorizontal(lipgloss.Top, tiles...)
+	// Clipped, not wrapped: the tile row is one line by construction, and the
+	// header height is measured from this same render — a wrapped bar would silently
+	// disagree with the viewport's idea of where the body starts.
+	bar := lipgloss.NewStyle().MaxWidth(max(m.width, 1)).Render(lipgloss.JoinHorizontal(lipgloss.Top, tiles...))
 	return lipgloss.JoinVertical(lipgloss.Left, title, bar, m.renderRule())
 }
 
@@ -729,14 +773,21 @@ func (m Model) renderHeader() string {
 func (m Model) renderRule() string {
 	w := max(m.width, 1)
 	label := m.currentFile()
+	// The check rides with the file name because "have I read this one" is a
+	// property of the file the reviewer is looking at, not of the change.
+	check := ""
+	if m.currentFileViewed() {
+		check = "✓ "
+	}
 	const lead = 2
+	shown := check + label
 	// Fall back to a plain rule when the name would leave no rule to speak of.
-	if label == "" || w < lead+lipgloss.Width(label)+6 {
+	if label == "" || w < lead+lipgloss.Width(shown)+6 {
 		return m.st.rule.Render(strings.Repeat("─", w))
 	}
-	tail := w - lead - lipgloss.Width(label) - 2
+	tail := w - lead - lipgloss.Width(shown) - 2
 	return m.st.rule.Render(strings.Repeat("─", lead)) + " " +
-		m.st.breadcrumb.Render(label) + " " +
+		m.st.viewed.Render(check) + m.st.breadcrumb.Render(label) + " " +
 		m.st.rule.Render(strings.Repeat("─", max(tail, 0)))
 }
 
@@ -771,10 +822,19 @@ func (m Model) otherView() string {
 	return "split"
 }
 
-// renderFooter is the keybinding line, in a long form when there is room for it
-// and a short one when there is not. Two tiers rather than a per-hint fit: the
-// hints a reviewer needs at 80 columns are not the tail of the list they need at
-// 200, they are a different list.
+// hintTiers is how many footer hint lists there are, tried widest-first.
+const hintTiers = 4
+
+// renderFooter is the keybinding line for the current mode, at the longest hint
+// list that fits the terminal.
+//
+// The lists a reviewer needs at 80 columns and at 200 are different lists, not a
+// prefix and a suffix of one list, so the footer picks a list rather than fitting
+// hints one at a time. Which list is chosen is *measured* against the actual
+// rendered width rather than compared to a column threshold: the hints interpolate
+// counts ("n/p elision (240/1200)"), so any hardcoded threshold is wrong for some
+// change — and a footer wider than the terminal is silently clipped, losing its
+// tail, which is where `q quit` lives.
 func (m Model) renderFooter() string {
 	if m.searching {
 		hint := "type to search · esc cancel"
@@ -786,36 +846,101 @@ func (m Model) renderFooter() string {
 		return lipgloss.NewStyle().MaxWidth(max(m.width, 1)).Render(line)
 	}
 
-	wide := m.width >= 100
-	var help string
+	scroll := m.scrollLabel()
+	for tier := hintTiers - 1; tier > 0; tier-- {
+		help := strings.Join(m.hints(tier), " · ")
+		// One cell minimum between the hints and the percentage, or they touch.
+		if lipgloss.Width(help)+1+lipgloss.Width(scroll) <= m.width {
+			return m.footerLine(help, scroll)
+		}
+	}
+	// The narrowest list is used whether or not it fits; at that point there is
+	// nothing left to drop.
+	return m.footerLine(strings.Join(m.hints(0), " · "), scroll)
+}
+
+// hints is the footer's hint list for the current mode at a given width tier, in
+// reading order. Tier 0 is what a reviewer cannot work without; each tier above it
+// adds what the next stretch of terminal can afford, ordered so the keys that do
+// the most work survive the longest:
+//
+//	1  file and hunk stepping — how you get around a fifteen-file change
+//	2  view switching and the audit view — mode changes, not motion
+//	3  tab and g/G — shortcuts for something already reachable another way
+//
+// `v` is in every tier: it is the only key that records a decision rather than
+// moving the screen, so a reviewer who never sees it never learns the tool is
+// tracking their progress at all.
+func (m Model) hints(tier int) []string {
+	// The audit view has no files to step and nothing to check off. It is one list,
+	// and the only question it raises is how to get back out.
+	if m.audit {
+		return []string{"j/k scroll", "a/esc back to review", "q quit"}
+	}
+	var h []string
 	switch {
-	case m.audit:
-		help = "j/k scroll · a/esc back to review · q quit"
 	case m.searchActive():
-		help = fmt.Sprintf("n/N match (%d/%d) · esc clear · q quit", m.hitCur+1, len(m.hits))
-		if wide {
-			help = fmt.Sprintf("n/N match (%d/%d) · esc clear · ]/[ file · u %s · a audit · q quit",
-				m.hitCur+1, len(m.hits), m.otherView())
+		h = append(h, fmt.Sprintf("n/N match (%d/%d)", m.hitCur+1, len(m.hits)), "esc clear")
+		if tier >= 1 {
+			h = append(h, "]/[ file")
 		}
 	case len(m.marks) == 0:
-		help = "j/k scroll · / search · q quit"
-		if wide {
-			help = fmt.Sprintf("j/k scroll · g/G top/bottom · ]/[ file · }/{ hunk · / search · u %s · a audit · q quit",
-				m.otherView())
+		h = append(h, "j/k scroll")
+		if tier >= 3 {
+			h = append(h, "g/G top/bottom")
+		}
+		if tier >= 1 {
+			h = append(h, "]/[ file", "}/{ hunk")
 		}
 	default:
-		help = fmt.Sprintf("n/p elision (%d/%d) · e expand · / search · q quit", m.cur+1, len(m.marks))
-		if wide {
-			help = fmt.Sprintf("n/p elision (%d/%d) · e expand · E all · ]/[ file · }/{ hunk · / search · u %s · a audit · q quit",
-				m.cur+1, len(m.marks), m.otherView())
+		h = append(h, fmt.Sprintf("n/p elision (%d/%d)", m.cur+1, len(m.marks)), "e expand")
+		if tier >= 1 {
+			h = append(h, "E all", "]/[ file", "}/{ hunk")
 		}
 	}
-
-	pct := 0
-	if m.ready {
-		pct = int(m.vp.ScrollPercent() * 100)
+	if len(m.files) > 0 {
+		h = append(h, "v viewed")
+		if tier >= 3 {
+			h = append(h, "tab unviewed")
+		}
 	}
-	scroll := fmt.Sprintf("%3d%%", pct)
+	// A live search owns n/N and esc; offering `/ search` again says nothing.
+	if !m.searchActive() {
+		h = append(h, "/ search")
+	}
+	if tier >= 2 {
+		h = append(h, fmt.Sprintf("u %s", m.otherView()), "a audit")
+	}
+	return append(h, "q quit")
+}
+
+// scrollLabel is the right-hand percentage, fixed width so the hints do not shift
+// as the reviewer scrolls.
+//
+// It measures progress through the content, not through the viewport: the blank tail
+// setContent appends is scrollable but is not diff, and counting it would report the
+// end of a change as somewhere around 60%.
+func (m Model) scrollLabel() string {
+	return fmt.Sprintf("%3d%%", m.scrollPercent())
+}
+
+func (m Model) scrollPercent() int {
+	if !m.ready {
+		return 0
+	}
+	if m.audit {
+		return int(m.vp.ScrollPercent() * 100)
+	}
+	height := m.vp.Height()
+	if len(m.body) <= height {
+		return 100
+	}
+	bottom := m.vp.YOffset() + height
+	return min(100, max(bottom*100/len(m.body), 0))
+}
+
+// footerLine right-aligns the scroll percentage against the hints.
+func (m Model) footerLine(help, scroll string) string {
 	gap := max(m.width-lipgloss.Width(help)-lipgloss.Width(scroll), 1)
 	return m.st.footer.MaxWidth(max(m.width, 1)).Render(help + strings.Repeat(" ", gap) + scroll)
 }
@@ -885,7 +1010,26 @@ func (m Model) topRow() int {
 			return r
 		}
 	}
+	// Scrolled into the blank tail setContent appends. The reviewer is still looking
+	// at the end of the last file, so report its last row; falling off the end here
+	// would snap the breadcrumb back to the first file.
+	for i := len(m.body) - 1; i >= 0; i-- {
+		if r := m.body[i].firstRow(); r >= 0 {
+			return r
+		}
+	}
 	return len(m.rows)
+}
+
+// gotoBottom scrolls to the end of the content rather than the end of the padded
+// viewport content, so G fills the screen with the tail of the diff instead of with
+// the blank tail behind it.
+func (m *Model) gotoBottom() {
+	if m.audit {
+		m.vp.GotoBottom()
+		return
+	}
+	m.vp.SetYOffset(max(len(m.body)-m.vp.Height(), 0))
 }
 
 // stepAnchor jumps to the next or previous row in a sorted list of anchors — file
