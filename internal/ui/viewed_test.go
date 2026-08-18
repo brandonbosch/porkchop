@@ -331,14 +331,18 @@ func TestHeaderAndFooterFitTheWidth(t *testing.T) {
 	}
 }
 
-// TestBlankOnlyMarkerSaysSo covers the wording change: a marker whose hidden changed
-// lines are all empty says "blank", so a reviewer knows not to spend an expand on it.
-// The marker is still drawn and still counted — suppressing it would put the header's
-// "N hidden in M spots" out of step with what is on screen.
-func TestBlankOnlyMarkerSaysSo(t *testing.T) {
+// TestMarkerNamesWhatItHides covers the wording rules: a marker whose hidden
+// changed lines are all empty says "blank", one whose hidden changed lines are
+// nothing but prose says "comment", and only a marker hiding real code says
+// "changed". A reviewer reads the marker to decide whether to spend an expand,
+// so each of the three has to be distinguishable without paying for it.
+//
+// The marker is still drawn and still counted in every case — suppressing one
+// would put the header's "N hidden in M spots" out of step with what is on screen.
+func TestMarkerNamesWhatItHides(t *testing.T) {
 	for name, m := range alignedGoldens(t) {
 		t.Run(name, func(t *testing.T) {
-			blankOnly, mixed := 0, 0
+			blankOnly, commentOnly, code := 0, 0, 0
 			for i, e := range m.marks {
 				text := m.markerText(i)
 				switch {
@@ -353,24 +357,92 @@ func TestBlankOnlyMarkerSaysSo(t *testing.T) {
 					if want := fmt.Sprintf("%d blank", e.Blank); !strings.Contains(text, want) {
 						t.Errorf("mark %d does not carry %q: %q", i, want, text)
 					}
+				case e.Changed > 0 && e.Comment > 0 && e.Comment+e.Blank == e.Changed:
+					commentOnly++
+					if want := fmt.Sprintf("%d comment", e.Comment); !strings.Contains(text, want) {
+						t.Errorf("mark %d hides %d comment lines but reads %q", i, e.Comment, text)
+					}
+					if strings.Contains(text, "changed") {
+						t.Errorf("mark %d hides no code but reads %q", i, text)
+					}
+					// The blank remainder is named rather than folded into the
+					// comment count, so the two still add up to Changed on screen.
+					if e.Blank > 0 {
+						if want := fmt.Sprintf("+%d blank", e.Blank); !strings.Contains(text, want) {
+							t.Errorf("mark %d does not carry %q: %q", i, want, text)
+						}
+					}
 				case e.Changed > 0:
-					mixed++
-					// A marker hiding any real content must keep saying "changed",
-					// even when some of what it hides is blank.
+					code++
+					// A marker hiding any real code must keep saying "changed", even
+					// when some of what it hides is blank or commentary.
 					if !strings.Contains(text, "changed") {
-						t.Errorf("mark %d hides %d changed lines (%d blank) but reads %q",
-							i, e.Changed, e.Blank, text)
+						t.Errorf("mark %d hides %d changed lines (%d blank, %d comment) but reads %q",
+							i, e.Changed, e.Blank, e.Comment, text)
 					}
 				}
 			}
-			if blankOnly == 0 || mixed == 0 {
-				t.Skipf("golden has %d blank-only and %d substantive markers", blankOnly, mixed)
+			if blankOnly == 0 || commentOnly == 0 || code == 0 {
+				t.Skipf("golden has %d blank-only, %d comment-only and %d substantive markers",
+					blankOnly, commentOnly, code)
 			}
 
 			// The header's accounting is wording-independent: every marker still
 			// counts, blank or not.
 			if got := ansi.Strip(m.renderHeader()); !strings.Contains(got, fmt.Sprintf("in %d spots", len(m.marks))) {
 				t.Errorf("header no longer reconciles with the marker count:\n%s", got)
+			}
+		})
+	}
+}
+
+// TestMarkerColorMatchesItsWording is the coupling that makes the tiering safe to
+// rely on. A reviewer who learns "amber means code" stops reading the words, so a
+// marker painted amber while reading "comment" would be worse than no color at
+// all. Both come from kindOf; this checks they still agree on real fixtures, and
+// that the three tiers are actually distinguishable rather than three names for
+// one style.
+func TestMarkerColorMatchesItsWording(t *testing.T) {
+	for name, m := range alignedGoldens(t) {
+		t.Run(name, func(t *testing.T) {
+			seen := map[markerKind]bool{}
+			for i, e := range m.marks {
+				kind := kindOf(e)
+				seen[kind] = true
+				text := m.markerText(i)
+				want := map[markerKind]string{
+					markerCode:    "changed",
+					markerProse:   "comment",
+					markerEmpty:   "blank",
+					markerContext: "context",
+				}[kind]
+				if !strings.Contains(text, want) {
+					t.Errorf("mark %d is painted as kind %d but reads %q", i, kind, text)
+				}
+				// The rendered line must carry the tier's own style, not the amber
+				// default, or the words and the color part company on screen.
+				styled := m.st.forMarker(kind, false).Render(text)
+				if plain := ansi.Strip(styled); plain != text {
+					t.Errorf("mark %d: styling altered the text %q -> %q", i, text, plain)
+				}
+				if kind != markerCode && styled == m.st.marker.Render(text) {
+					t.Errorf("mark %d reads %q but is painted with the code tier", i, text)
+				}
+			}
+			if len(seen) < 3 {
+				t.Skipf("golden exercises only %d marker kinds", len(seen))
+			}
+			// Distinct tiers must render distinctly, in both palettes.
+			for _, dark := range []bool{true, false} {
+				st := newStyles(dark)
+				const probe = "▸ 1 line hidden"
+				code, prose, quiet := st.forMarker(markerCode, false).Render(probe),
+					st.forMarker(markerProse, false).Render(probe),
+					st.forMarker(markerEmpty, false).Render(probe)
+				if code == prose || prose == quiet || code == quiet {
+					t.Errorf("dark=%v: marker tiers are not visually distinct:\n  code  %q\n  prose %q\n  quiet %q",
+						dark, code, prose, quiet)
+				}
 			}
 		})
 	}

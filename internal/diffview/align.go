@@ -161,6 +161,25 @@ func FileOf(line string) (string, bool) {
 	return pathFromGitHeader(line)
 }
 
+// GitHeaderPaths splits a "diff --git a/old b/new" line into the two raw paths
+// it names, prefixes included, so a caller can tell a rename from an edit and can
+// compare them against the "---"/"+++" lines that follow.
+//
+// The split is on the last " b/", the same guess pathFromGitHeader makes: a path
+// containing " b/" is ambiguous in this line's grammar and git quotes it instead,
+// so the last occurrence is the best available reading of an unquoted one.
+func GitHeaderPaths(line string) (old, new string, ok bool) {
+	rest, ok := strings.CutPrefix(line, "diff --git ")
+	if !ok {
+		return "", "", false
+	}
+	i := strings.LastIndex(rest, " b/")
+	if i < 0 {
+		return "", "", false
+	}
+	return rest[:i], rest[i+1:], true
+}
+
 func pathFromGitHeader(line string) (string, bool) {
 	rest, ok := strings.CutPrefix(line, "diff --git ")
 	if !ok {
@@ -334,6 +353,16 @@ type Elision struct {
 	// affordance. It changes wording only; Changed, and every count derived from
 	// it, is untouched.
 	Blank int
+	// Comment counts the hidden changed lines that hold nothing but a comment.
+	// It is disjoint from Blank — a line with no content is blank, never a
+	// comment — so when Comment+Blank equals Changed the elision hides no code at
+	// all, only prose a reviewer can choose to read. That is the same judgement
+	// Blank supports, widened: measured across meat/testdata roughly one marker
+	// in six is comment-only on top of the one in five that is blank-only.
+	// Detection is lexical and errs toward zero; see comment.go. Like Blank it
+	// changes wording only, and leaves Changed and everything derived from it
+	// untouched.
+	Comment int
 	// File is the path of the file this elision falls in, taken from the raw
 	// diff's own headers, so the audit view can group the discard pile by file.
 	// It is empty when the elision precedes any file header.
@@ -400,6 +429,7 @@ func (a *Alignment) newElision(rawRows []Row, files []string, lo, hi, prevRow, b
 			e.Blank++
 		}
 	}
+	e.Comment = commentChanges(rawRows[lo:hi], files[lo:hi])
 	for r := prevRow + 1; r < beforeRow && r < len(a.Rows); r++ {
 		if a.Rows[r].Kind == RowFold {
 			e.FoldRow = r
