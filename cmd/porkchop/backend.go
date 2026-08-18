@@ -20,7 +20,7 @@ type backendFlags struct {
 func addBackendFlags(fs *flag.FlagSet) *backendFlags {
 	return &backendFlags{
 		provider: fs.String("provider", "", "inference backend: bedrock (default), anthropic, openai, openai-compat"),
-		modelID:  fs.String("model", "", "model id (for bedrock, a full inference profile id)"),
+		modelID:  fs.String("model", "", "model id (for bedrock, a Bedrock inference profile id, not an ~/.aws named profile)"),
 		region:   fs.String("region", "", "AWS region for bedrock (default $PORKCHOP_BEDROCK_REGION or the AWS config)"),
 		baseURL:  fs.String("base-url", "", "endpoint override; required for openai-compat"),
 	}

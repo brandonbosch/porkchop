@@ -93,7 +93,7 @@ func Resolve(cfg Config) (Config, error) {
 		cfg.Region = cmp.Or(cfg.Region, os.Getenv("PORKCHOP_BEDROCK_REGION"), os.Getenv("AWS_REGION"), os.Getenv("AWS_DEFAULT_REGION"))
 		cfg.APIKey = cmp.Or(cfg.APIKey, os.Getenv("AWS_BEARER_TOKEN_BEDROCK"))
 		if cfg.Model == "" {
-			return Config{}, fmt.Errorf("porkchop: bedrock needs an inference profile id: pass -model (e.g. -model us.anthropic.claude-sonnet-4-5-20250929-v1:0) or set $PORKCHOP_MODEL")
+			return Config{}, fmt.Errorf("porkchop: bedrock needs a Bedrock inference profile id — an AWS resource naming a model, not the ~/.aws named profile $AWS_PROFILE selects: pass -model (e.g. -model us.anthropic.claude-sonnet-4-5-20250929-v1:0) or set $PORKCHOP_MODEL; list them with `aws bedrock list-inference-profiles --region <region>`")
 		}
 		// A Bedrock API key carries no region, and fantasy defaults a missing
 		// one to commercial us-east-1. In GovCloud — or any partition that is

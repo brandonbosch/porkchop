@@ -79,9 +79,13 @@ Flags:
                   openai-compat. Bedrock is the default because everything sent
                   to a model here — the diff, and the surrounding source meat's
                   tools read — is assumed to be CUI; a public API takes asking.
-  -model string   Model id (default $PORKCHOP_MODEL, then $MEAT_MODEL). Bedrock
-                  needs a full inference profile id and has no default, because
-                  the id is passed through verbatim and forms the cache key.
+  -model string   Model id (default $PORKCHOP_MODEL, then $MEAT_MODEL). For
+                  bedrock this is a Bedrock *inference profile* id, e.g.
+                  us.anthropic.claude-sonnet-4-5-20250929-v1:0 — an AWS resource
+                  that names a model, and NOT the named profile in ~/.aws/config
+                  that $AWS_PROFILE selects. It has no default, because the id
+                  is passed through verbatim and forms the cache key. List them
+                  with: aws bedrock list-inference-profiles --region <region>
   -region string  AWS region for bedrock (default $PORKCHOP_BEDROCK_REGION,
                   $AWS_REGION, or your AWS config). Required when authenticating
                   with a Bedrock API key, which carries no region of its own.
