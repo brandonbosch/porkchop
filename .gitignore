@@ -1,1 +1,6 @@
 /meat-bin
+
+# Local credentials: never commit. porkchop reads AWS_BEARER_TOKEN_BEDROCK
+# and the AWS chain from the environment, never from a file in the repo.
+.env
+.env.*

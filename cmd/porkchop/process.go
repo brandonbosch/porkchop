@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/brandonbosch/porkchop/internal/gitx"
+	"github.com/brandonbosch/porkchop/internal/model"
 	"github.com/brandonbosch/porkchop/internal/store"
 	"github.com/brandonbosch/porkchop/meat"
 )
@@ -33,7 +34,14 @@ An empty diff is success, not an error: a commit that changed nothing is a
 perfectly good thing for a hook to encounter.
 
 Flags:
-  -model string   Model to use (default $MEAT_MODEL or a built-in default).
+  -provider name  Inference backend: bedrock (default), anthropic, openai,
+                  openai-compat.
+  -model string   Model id (default $PORKCHOP_MODEL, then $MEAT_MODEL). Bedrock
+                  needs a full inference profile id and has no default.
+  -region string  AWS region for bedrock; required with a Bedrock API key
+                  ($AWS_BEARER_TOKEN_BEDROCK), which carries no region.
+  -base-url url   Endpoint override; required for openai-compat, and the way to
+                  reach a Bedrock FIPS or VPC endpoint.
   -no-cache       Recompute even if a cached result exists (still updates cache).
   -staged         Process the staged changes (git diff --staged).
   -w              Process the unstaged working-tree changes (git diff).
@@ -88,7 +96,7 @@ func runProcess(args []string) {
 	fs := flag.NewFlagSet("porkchop process", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, processUsage) }
-	model := fs.String("model", "", "model to use (default $MEAT_MODEL or built-in default)")
+	backend := addBackendFlags(fs)
 	noCache := fs.Bool("no-cache", false, "recompute even if a cached result exists")
 	staged := fs.Bool("staged", false, "process the staged changes (git diff --staged)")
 	worktree := fs.Bool("w", false, "process the unstaged working-tree changes (git diff)")
@@ -121,10 +129,17 @@ func runProcess(args []string) {
 		return
 	}
 
-	resolved := meat.ResolveModel(*model)
-	report.Model = resolved
+	// Resolved offline, before any credential work, so the cache key is known
+	// without deciding whether inference is needed. An empty diff has already
+	// returned above: a hook must not start failing on empty commits just
+	// because no backend is configured.
+	backendCfg, err := model.Resolve(backend.config())
+	if err != nil {
+		fatal("%v", err)
+	}
+	report.Model = backendCfg.Model
 	dir := store.Dir()
-	report.Key = store.Key(diff, resolved, meat.RubricHash())
+	report.Key = store.Key(diff, backendCfg.Model, meat.RubricHash())
 
 	if !*noCache {
 		if cached, ok := store.Load(dir, report.Key); ok {
@@ -145,7 +160,7 @@ func runProcess(args []string) {
 	}
 
 	ctx := context.Background()
-	m, err := meat.NewModelFromEnv(ctx, *model)
+	m, err := model.Open(ctx, backendCfg)
 	if err != nil {
 		fatal("%v", err)
 	}

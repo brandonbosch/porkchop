@@ -56,9 +56,17 @@ func (r result) all() string { return r.stdout + r.stderr }
 // only meaningful if a miss would have failed.
 func runIn(t *testing.T, dir, cache string, args ...string) result {
 	t.Helper()
+	return runInEnv(t, dir, cache, nil, args...)
+}
+
+// runInEnv is runIn with extra environment entries, for the tests that need to
+// describe a broken credential setup rather than merely an absent one.
+func runInEnv(t *testing.T, dir, cache string, extraEnv []string, args ...string) result {
+	t.Helper()
 	cmd := exec.Command(binPath, args...)
 	cmd.Dir = dir
-	cmd.Env = append(strippedEnv(), "MEAT_CACHE="+cache)
+	cmd.Env = append(strippedEnv(), "MEAT_CACHE="+cache, "PORKCHOP_MODEL="+testModel)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	var out, errb strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
@@ -71,12 +79,28 @@ func runIn(t *testing.T, dir, cache string, args ...string) result {
 	return result{stdout: out.String(), stderr: errb.String(), code: code}
 }
 
+// testModel is the model id these tests pin. It has to be a real-looking
+// Bedrock inference profile because the id is part of the cache key: a cache
+// hit means knowing which model produced the entry, even though none of these
+// tests can reach one. Nothing here has credentials, so no request is possible.
+const testModel = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+
 func strippedEnv() []string {
 	var env []string
 	for _, kv := range os.Environ() {
-		switch strings.SplitN(kv, "=", 2)[0] {
-		case "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "MEAT_CACHE", "MEAT_MODEL":
+		switch key := strings.SplitN(kv, "=", 2)[0]; key {
+		case "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "MEAT_CACHE", "MEAT_MODEL",
+			// A Bedrock API key left in the environment would send the
+			// no-fallback test down the bearer branch, where it would pass
+			// without testing anything.
+			"AWS_BEARER_TOKEN_BEDROCK":
 			continue
+		default:
+			// A developer's own PORKCHOP_* settings would otherwise choose a
+			// different backend, and with it a different cache key.
+			if strings.HasPrefix(key, "PORKCHOP_") {
+				continue
+			}
 		}
 		env = append(env, kv)
 	}
@@ -135,7 +159,7 @@ func seedCache(t *testing.T, repo, cache string, args []string) (key, smart stri
 		t.Fatalf("no diff for %v (%s)", args, source)
 	}
 	smart = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,2 @@\n+SEEDED-READING-DIFF\n"
-	key = store.Key(diff, meat.ResolveModel(""), meat.RubricHash())
+	key = store.Key(diff, testModel, meat.RubricHash())
 	store.Store(cache, key, &meat.Result{Summary: "SEEDED-SUMMARY", SmartDiff: smart})
 	if _, ok := store.Load(cache, key); !ok {
 		t.Fatal("seeding the cache did not take")
@@ -609,6 +633,50 @@ func TestSubcommandVerbHint(t *testing.T) {
 
 // TestHelpVerb checks `porkchop help` works, since it is what someone types before
 // they know that -h is the flag. It goes to stdout so it can be piped to a pager.
+// TestBedrockWithoutCredentialsRefusesRatherThanFallingBack exercises the whole
+// wiring, not just internal/model: a real binary, a real cache miss, an
+// ANTHROPIC_API_KEY sitting in the environment the way a laptop used for home
+// projects would have one, and no AWS credentials at all.
+//
+// fantasy's Bedrock path swallows a credential-loading error and leaves a plain
+// Anthropic client aimed at api.anthropic.com, so the failure this guards
+// against is not a crash — it is a run that looks like it worked while sending
+// a CUI diff to a public API. The assertion is therefore about what did *not*
+// happen: a non-zero exit, and nothing written to the cache.
+func TestBedrockWithoutCredentialsRefusesRatherThanFallingBack(t *testing.T) {
+	repo := newRepo(t)
+	cache := t.TempDir()
+	awsHome := t.TempDir()
+
+	res := runInEnv(t, repo, cache, []string{
+		"ANTHROPIC_API_KEY=sk-ant-this-must-never-be-used",
+		"AWS_CONFIG_FILE=" + filepath.Join(awsHome, "config"),
+		"AWS_SHARED_CREDENTIALS_FILE=" + filepath.Join(awsHome, "credentials"),
+		"AWS_EC2_METADATA_DISABLED=true",
+		"AWS_REGION=us-east-1",
+		"AWS_ACCESS_KEY_ID=",
+		"AWS_SECRET_ACCESS_KEY=",
+		"AWS_PROFILE=",
+	}, "process", "HEAD", "-provider", "bedrock")
+
+	if res.code == 0 {
+		t.Fatalf("process succeeded with no AWS credentials; that means it reached something else:\n%s", res.all())
+	}
+	if !strings.Contains(res.all(), "bedrock") {
+		t.Errorf("error does not name bedrock:\n%s", res.all())
+	}
+	if strings.Contains(res.all(), "sk-ant-") {
+		t.Errorf("the API key leaked into the error:\n%s", res.all())
+	}
+	entries, err := os.ReadDir(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("cache has %d entries, want none: a refused run must not store a result", len(entries))
+	}
+}
+
 func TestHelpVerb(t *testing.T) {
 	repo, cache := newRepo(t), t.TempDir()
 	got := runIn(t, repo, cache, "help")
